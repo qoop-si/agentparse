@@ -1,0 +1,16 @@
+{
+  "id": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "projectID": "e4d909c290d0fb1ca068ffaddf22cbd0cd8aaaaa",
+  "directory": "/work/demo",
+  "title": "Legacy fix the greeting",
+  "version": "0.15.31",
+  "time": {
+    "created": 1750000000000,
+    "updated": 1750000020000
+  },
+  "summary": {
+    "additions": 1,
+    "deletions": 1,
+    "files": 1
+  }
+}

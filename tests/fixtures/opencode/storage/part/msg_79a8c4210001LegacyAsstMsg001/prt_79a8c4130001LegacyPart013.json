@@ -1,0 +1,26 @@
+{
+  "id": "prt_79a8c4130001LegacyPart013",
+  "sessionID": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "messageID": "msg_79a8c4210001LegacyAsstMsg001",
+  "type": "tool",
+  "callID": "toolu_legacy0001",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "cat hello.txt",
+      "description": "Print the greeting"
+    },
+    "output": "helo world\n",
+    "title": "cat hello.txt",
+    "metadata": {
+      "output": "helo world\n",
+      "exit": 0,
+      "description": "Print the greeting"
+    },
+    "time": {
+      "start": 1750000002100,
+      "end": 1750000002200
+    }
+  }
+}

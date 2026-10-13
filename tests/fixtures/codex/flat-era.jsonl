@@ -1,0 +1,12 @@
+{"id":"019f1a30-0001-7000-8000-000000000001","timestamp":"2025-08-20T10:00:00.000Z","instructions":"Synthetic user instructions.","git":{"commit_hash":"0123456789abcdef0123456789abcdef01234567","branch":"main","repository_url":"https://example.com/demo.git"}}
+{"record_type":"state"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"list the files"}]}
+{"type":"reasoning","summary":[{"type":"summary_text","text":"Plan the listing."}],"encrypted_content":"gAAAAAB0ZmFrZQ=="}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will run ls."}]}
+{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls\"],\"workdir\":\"/work/demo\",\"timeout_ms\":null}","call_id":"call_c03940b29617b0322e25b2af2ca85779"}
+{"type":"function_call_output","call_id":"call_c03940b29617b0322e25b2af2ca85779","output":"{\"output\":\"README.md\\nsrc\\n\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":0.1}}"}
+{"record_type":"state"}
+{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"cat missing.txt\"],\"workdir\":\"/work/demo\",\"timeout_ms\":null}","call_id":"call_cfd3ef65d4d31943e31ded7b9aa04d2e"}
+{"type":"function_call_output","call_id":"call_cfd3ef65d4d31943e31ded7b9aa04d2e","output":"{\"output\":\"cat: missing.txt: No such file or directory\\n\",\"metadata\":{\"exit_code\":1,\"duration_seconds\":0.0}}"}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The directory has README.md and src. missing.txt does not exist."}]}
+{"record_type":"state"}

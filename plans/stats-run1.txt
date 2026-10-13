@@ -1,0 +1,36 @@
+== claude
+  sessions 17900  failures {}  warnings 40  entries 1238082  orphan results 40
+  parse ms p50 2.22 p90 6.65 p99 61.34 max 740.1  total 91.8s  123 MB/s
+  entries: message 773423, other 345623, hook 69091, settings 21631, turn 18969, notice 7382, error 1606, compaction 357
+  messages: assistant/model 482867, user/context 204137, system/context 31682, user/agent 19254, user/human 18299, user/notification 15720, user/command 1424, user/tool 40
+  tools: shell 335629, read 81884, edit 33684, mcp 24833, other 17751, web_fetch 13291, task 11669, web_search 11023, write 8914, skill 1024, question 840, process 423, plan 66, search 15
+  status: ok 522394, error 16412, rejected 1426, interrupted 767, pending 47
+  exit codes: none 321249, 1 7651, 0 5187, 2 625, 143 402, 128 119, 127 84, 255 77, 7 34, 124 22, 8 20, 137 17, 28 17, 5 14, 144 13, 254 12, 56 10, 3 8, 69 7, 72 6, 125 5, 129 5, 52 5, 126 4, 234 4
+  other kinds: last-prompt 73904, mode 70746, queue-operation 40366, atis-latch 32543, pr-link 26699, file-history-snapshot 19827, attachment.task_reminder 18487, attachment.deferred_tools_delta 16193, attachment.deferred_tools_record 11955, attachment.diagnostics 5587, bridge-session 5524, attachment.prompt_snapshot 4424, file-history-delta 3805, worktree-state 3122, relocated 2447, attachment.credential_org 1807, attachment.bash_output_audience_note 1281, attachment.agent_listing_delta 1099, attachment.command_permissions 1016, attachment.mcp_instructions_delta 983, frame-link 979, attachment.date_change 861, attachment.compact_file_reference 448, attachment.auto_mode 349, attachment.edited_text_file 220
+== codex
+  sessions 132  failures {}  warnings 0  entries 4023  orphan results 0
+  parse ms p50 2.03 p90 2.83 p99 3.85 max 4.8  total 0.3s  216 MB/s
+  entries: message 2166, other 1560, settings 165, turn 132
+  messages: assistant/model 1095, system/context 660, user/context 175, user/agent 137, user/human 99
+  tools: shell 983, code 786, task 132, web_search 10, web_fetch 9, other 1
+  status: ok 1850, error 71
+  exit codes: 0 912, 1 45, 2 25, 3 1
+  other kinds: token_count 1092, world_state 166, inter_agent_communication_metadata 137, task_started 134, part:encrypted_content 115, SubAgentActivity 31
+== gemini
+  sessions 2  failures {}  warnings 0  entries 2  orphan results 0
+  parse ms p50 0.49 p90 0.49 p99 0.49 max 0.5  total 0.0s  6 MB/s
+  entries: message 2
+  messages: user/context 2
+  tools: 
+  status: 
+  exit codes: 
+  other kinds: 
+== opencode
+  sessions 64  failures {}  warnings 0  entries 317  orphan results 0
+  parse ms p50 0.65 p90 1.03 p99 1.63 max 5.2  total 0.0s  0 MB/s
+  entries: message 246, other 47, turn 17, error 7
+  messages: assistant/model 134, user/human 64, system/context 47, user/notification 1
+  tools: todo 54, shell 11, task 6, edit 2, read 2
+  status: ok 74, error 1
+  exit codes: 0 10, 3 1
+  other kinds: part:step-finish 101, part:step-start 101, todos 47

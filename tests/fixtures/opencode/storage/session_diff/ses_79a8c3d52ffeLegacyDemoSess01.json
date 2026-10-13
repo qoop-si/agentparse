@@ -1,0 +1,8 @@
+[
+  {
+    "file": "/work/demo/hello.txt",
+    "patch": "@@ -1 +1 @@\n-helo world\n+hello world\n",
+    "additions": 1,
+    "deletions": 1
+  }
+]

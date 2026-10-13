@@ -1,0 +1,27 @@
+{
+  "id": "msg_79a8c4210001LegacyAsstMsg001",
+  "sessionID": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "role": "assistant",
+  "time": {
+    "created": 1750000001000,
+    "completed": 1750000019000
+  },
+  "parentID": "msg_79a8c3e10001LegacyUserMsg001",
+  "modelID": "demo-sonnet",
+  "providerID": "anthropic",
+  "mode": "build",
+  "path": {
+    "cwd": "/work/demo",
+    "root": "/work/demo"
+  },
+  "cost": 0.0123,
+  "tokens": {
+    "input": 900,
+    "output": 140,
+    "reasoning": 30,
+    "cache": {
+      "read": 1000,
+      "write": 200
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "prt_79a8c4110001LegacyPart011",
+  "sessionID": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "messageID": "msg_79a8c4210001LegacyAsstMsg001",
+  "type": "reasoning",
+  "text": "Check the greeting file first.",
+  "time": {
+    "start": 1750000001100,
+    "end": 1750000001600
+  }
+}

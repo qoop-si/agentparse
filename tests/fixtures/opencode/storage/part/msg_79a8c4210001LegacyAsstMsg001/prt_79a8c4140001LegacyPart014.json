@@ -1,0 +1,26 @@
+{
+  "id": "prt_79a8c4140001LegacyPart014",
+  "sessionID": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "messageID": "msg_79a8c4210001LegacyAsstMsg001",
+  "type": "tool",
+  "callID": "toolu_legacy0002",
+  "tool": "edit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/work/demo/hello.txt",
+      "oldString": "helo",
+      "newString": "hello"
+    },
+    "output": "",
+    "title": "hello.txt",
+    "metadata": {
+      "diff": "Index: /work/demo/hello.txt\n@@ -1 +1 @@\n-helo world\n+hello world\n",
+      "diagnostics": {}
+    },
+    "time": {
+      "start": 1750000003000,
+      "end": 1750000003100
+    }
+  }
+}
