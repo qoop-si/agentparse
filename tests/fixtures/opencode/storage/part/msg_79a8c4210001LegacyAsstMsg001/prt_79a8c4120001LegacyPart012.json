@@ -1,0 +1,11 @@
+{
+  "id": "prt_79a8c4120001LegacyPart012",
+  "sessionID": "ses_79a8c3d52ffeLegacyDemoSess01",
+  "messageID": "msg_79a8c4210001LegacyAsstMsg001",
+  "type": "text",
+  "text": "Let me look at the greeting.",
+  "time": {
+    "start": 1750000001700,
+    "end": 1750000002000
+  }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "agentparse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Parse Claude Code, Codex, OpenCode and Gemini CLI session transcripts into one detailed model"
+repository = "https://github.com/qoop-si/agentparse"
+keywords = ["claude", "codex", "opencode", "transcript", "parser"]
+categories = ["parser-implementations", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+# A range, not a caret: rusqlite links the C sqlite3 library, and Cargo allows only one
+# version of it per build graph, so callers pinned to an older rusqlite must still resolve.
+rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
+ruzstd = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
