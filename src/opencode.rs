@@ -162,8 +162,8 @@ pub fn parse_db(db: &Path, session_id: &str) -> Result<Session> {
         format,
     );
     let parent = parent_link(&conn, &row, session_id)?;
-    // The row's `cost` is the product's own running total for the whole session (title and
-    // compaction calls included), so it is the session cost; a 0 is the column default of
+    // The row's `cost` is the product's own running total for the whole session, so it is the
+    // session cost; a 0 is the column default of
     // sessions that predate the usage columns, and then the rows' own costs are the truth.
     session.usage.cost_usd = row
         .remove("cost")

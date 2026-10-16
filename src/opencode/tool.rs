@@ -255,7 +255,7 @@ fn build_call(mut raw: RawTool, cwd: Option<&str>) -> (ToolCall, Option<Value>) 
     let shell =
         (finished && matches!(tool, Tool::Shell(_))).then(|| shell_result(&mut raw, interrupted));
     let files = if raw.status == "completed" {
-        file_changes(&mut raw.metadata, &tool)
+        file_changes(&mut raw.metadata, &tool, &raw.text)
     } else {
         Vec::new()
     };
@@ -500,7 +500,7 @@ fn file_change(v: &Value) -> Option<FileChange> {
 
 /// Files a completed edit, write or patch call changed: from `metadata.files[]` /
 /// `metadata.filediff`, else the patch input, else the written path.
-fn file_changes(meta: &mut Map, tool: &Tool) -> Vec<FileChange> {
+fn file_changes(meta: &mut Map, tool: &Tool, result: &str) -> Vec<FileChange> {
     if !matches!(
         tool,
         Tool::Edit { .. } | Tool::Write { .. } | Tool::Patch { .. }
@@ -521,7 +521,12 @@ fn file_changes(meta: &mut Map, tool: &Tool) -> Vec<FileChange> {
     match tool {
         Tool::Patch { patch: text } => patch::parse(text),
         Tool::Write { path, .. } => {
-            let exists = take_with(meta, "exists", Value::as_bool);
+            // v1 says so in `metadata.exists`; v2 only in the result text.
+            let exists = take_with(meta, "exists", Value::as_bool).or_else(|| {
+                result
+                    .starts_with("Created file successfully")
+                    .then_some(false)
+            });
             let path = take_str(meta, "filepath").unwrap_or_else(|| path.clone());
             let op = if exists == Some(false) {
                 FileOp::Add

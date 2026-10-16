@@ -68,7 +68,7 @@ Tool names from both generations are understood: `bash` and `shell`, `task` and 
 
 ## Usage
 
-One `Message.usage` per assistant message. OpenCode counts reasoning separately from output, so agentparse adds it to `output` and also reports it in `reasoning`. `cost_usd` is the recorded cost, and the session cost is the sum of recorded costs. See [Usage and Status](#conventions).
+One `Message.usage` per assistant message. OpenCode counts reasoning separately from output, so agentparse adds it to `output` and also reports it in `reasoning`. `cost_usd` is the recorded cost, and the session cost is the session row's recorded cost when it is above 0, else the sum of the message costs. `Session.usage` tokens are the sum of the messages. The session row's own `tokens_*` columns can be larger than that sum, since the database holds no message row for some model calls. They stay in `Session.extra`. See [Usage and Status](#conventions).
 
 ## Subagents
 

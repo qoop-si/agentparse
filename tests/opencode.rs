@@ -2677,3 +2677,29 @@ fn json_tree_part_ids_do_not_leak_into_extra_or_data() {
         "{json}"
     );
 }
+
+#[test]
+fn v2_write_tells_a_created_file_from_an_overwrite() {
+    let db = v2_db();
+    let write = |id: &str, result: &str| {
+        tool_block(
+            id,
+            "write",
+            json!({"status": "completed", "input": {"path": "/w/a.md", "content": "x"},
+                "content": [{"type": "text", "text": result}], "metadata": {"truncated": false}}),
+        )
+    };
+    insert_v2(
+        &db,
+        1,
+        "assistant",
+        json!({"time": {"created": 101}, "content": [
+            write("new", "Created file successfully: a.md"),
+            write("old", "Wrote file successfully: a.md"),
+        ]}),
+    );
+    let s = db.parse("ses_v2");
+    let op = |id: &str| call(&s, id).output.as_ref().unwrap().files[0].op;
+    assert_eq!(op("new"), FileOp::Add);
+    assert_eq!(op("old"), FileOp::Update);
+}
