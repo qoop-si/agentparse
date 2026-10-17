@@ -62,6 +62,7 @@ impl Parser {
         self.calls.insert(id.clone(), r);
         if cell {
             self.open_cells.push(id.clone());
+            self.cells.push(id.clone());
         }
         if let Some(exec) = waited {
             self.open_cells.push(exec.clone());
@@ -85,9 +86,9 @@ impl Parser {
         let Some(r) = self.calls.get(&call_id).copied() else {
             return self.orphan_output(call_id, body, extra);
         };
-        let ts = self.rec.ts;
+        let (ts, cwd) = (self.rec.ts, self.cwd());
         let Some(call) = self.call_mut(r) else { return };
-        let answer = fill_output(call, body, ts);
+        let answer = fill_output(call, body, ts, cwd);
         let polled = match &call.tool {
             Tool::Process {
                 id: Some(process), ..
@@ -200,7 +201,7 @@ impl Parser {
             .or_else(|| self.yielded.last().map(|(_, exec)| exec))
             .and_then(|id| self.calls.get(id))
             .copied();
-        match owner {
+        match owner.or_else(|| self.cell_running(&child)) {
             Some(cell) => self.push_child(cell, child),
             None => {
                 let result = ToolResult {
@@ -227,9 +228,52 @@ impl Parser {
         self.push_child(r, child);
     }
 
+    /// A command item recorded after its cell closed (an interrupted cell, a command that ended
+    /// with the cell) belongs to the latest recent cell whose script runs that command.
+    fn cell_running(&mut self, child: &ToolCall) -> Option<Ref> {
+        if !matches!(child.tool, Tool::Shell(_)) {
+            return None;
+        }
+        let recent: Vec<Ref> = (self.cells.iter().rev().take(8))
+            .filter_map(|id| self.calls.get(id).copied())
+            .collect();
+        recent.into_iter().find(|&r| {
+            let Some(cell) = self.call_mut(r) else {
+                return false;
+            };
+            let Tool::Code { source } = &cell.tool else {
+                return false;
+            };
+            let prefix = format!("{}#", cell.id);
+            let runs = super::js::invocations(source).map_or(0, |calls| {
+                (calls.iter())
+                    .filter(|(n, a)| {
+                        n == "exec_command" && same_command(&tool_for(n, a, None), &child.tool)
+                    })
+                    .count()
+            });
+            let recorded = (cell.children.iter())
+                .filter(|c| !c.id.starts_with(&prefix) && same_command(&c.tool, &child.tool))
+                .count();
+            recorded < runs
+        })
+    }
+
+    /// A recorded command replaces the child that was read from the cell's printed chunk.
     fn push_child(&mut self, cell: Ref, child: ToolCall) {
-        if let Some(cell) = self.call_mut(cell) {
-            cell.children.push(child);
+        let Some(cell) = self.call_mut(cell) else {
+            return;
+        };
+        let prefix = format!("{}#", cell.id);
+        let read = (cell.children.iter()).position(|c| {
+            let ended = exit_of(c).zip(exit_of(&child));
+            c.id.starts_with(&prefix)
+                && same_command(&c.tool, &child.tool)
+                && ended.is_none_or(|(a, b)| a == b)
+        });
+        match read {
+            Some(i) => cell.children[i] = child,
+            None => cell.children.push(child),
         }
     }
 
@@ -293,8 +337,18 @@ impl Parser {
     }
 }
 
+/// The exit code of a call that ran a command.
+pub(super) fn exit_of(call: &ToolCall) -> Option<i32> {
+    call.output.as_ref()?.shell.as_ref()?.exit_code
+}
+
+/// Both are shell commands with the same command text.
+pub(super) fn same_command(a: &Tool, b: &Tool) -> bool {
+    matches!((a, b), (Tool::Shell(a), Tool::Shell(b)) if a.command == b.command)
+}
+
 /// The typed view of a direct tool call's input.
-fn tool_for(name: &str, input: &Value, cwd: Option<String>) -> Tool {
+pub(super) fn tool_for(name: &str, input: &Value, cwd: Option<String>) -> Tool {
     let typed = match name {
         "exec" => input.as_str().map(|source| Tool::Code {
             source: source.to_owned(),

@@ -14,14 +14,19 @@
 //!   emitted once.
 //! - Tool outputs and completion events fold into their call. A code-mode `exec` cell gets the
 //!   tool items recorded between the call and its output as `children`; a command that outlives
-//!   its cell joins that cell later by process id.
+//!   its cell joins that cell later by process id, and a `Shell` item recorded after its cell
+//!   closed joins one of the last 8 cells that runs the same command text. A command the sandbox
+//!   refused has no item: when `js` can read the cell's program, each finished printed chunk
+//!   with no recorded item (same command text and exit code) becomes a child call. Headerless
+//!   (aborted) cells and chunks whose exit code is unreadable get none.
 //! - Unmapped keys: the `session_meta` rest goes to `Session.extra`; a record absorbed into an
 //!   entry goes to that entry's `extra` (the first record wins a key clash); call and output
 //!   records go to `extra.calls.<call_id>.{call,output}` of the message holding the call;
 //!   completion events go to `ToolOutput.data`.
 //!
 //! Layout: `messages` (input messages, model responses, usage), `tools` (calls and their typed
-//! inputs), `results` (what outputs, completion events and tool items say), `json` (helpers).
+//! inputs), `results` (what outputs, completion events and tool items say), `js` (the cell
+//! program reader), `json` (helpers).
 
 use crate::util::{Obj, as_extra, json_lines, obj_str, str_field, take_str, ts_ms};
 use crate::{
@@ -32,6 +37,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 
+mod js;
 mod json;
 mod messages;
 mod results;
@@ -134,6 +140,8 @@ struct Parser {
     calls: HashMap<String, Ref>,
     /// Code-mode cells whose output has not arrived: tool items recorded now are theirs.
     open_cells: Vec<String>,
+    /// Every `exec` cell call id, oldest first.
+    cells: Vec<String>,
     /// Yielded cells still running, oldest first: (cell id, the `exec` call that started it). A
     /// `wait` call id maps to that same `exec` call id.
     yielded: Vec<(String, String)>,
@@ -174,6 +182,7 @@ impl Parser {
             items: HashMap::new(),
             calls: HashMap::new(),
             open_cells: Vec::new(),
+            cells: Vec::new(),
             yielded: Vec::new(),
             waits: HashMap::new(),
             procs: HashMap::new(),

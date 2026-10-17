@@ -1286,6 +1286,239 @@ fn paginated_direct_exec_is_enriched_by_its_item() {
     );
 }
 
+fn script_call(id: &str, source: &str) -> Value {
+    rec(
+        "response_item",
+        json!({"type": "custom_tool_call", "call_id": id, "name": "exec", "input": source}),
+    )
+}
+
+fn chunk(exit: i64, output: &str) -> String {
+    json!({"chunk_id": "a1", "wall_time_seconds": 0.5, "exit_code": exit, "output": output})
+        .to_string()
+}
+
+#[test]
+fn a_command_refused_before_it_ran_becomes_a_child_from_its_printed_chunk() {
+    let script = "text(await tools.exec_command({cmd:\"make\", max_output_tokens:100}));\n\
+        text(await tools.exec_command({cmd:\"ps -ax\\n\", workdir:\"/w\", timeout_ms:5000}));\n\
+        text(await tools.write_stdin({session_id:9,chars:\"\"}));\n";
+    let s = session(&[
+        script_call("c1", script),
+        command_item("e1", "agent", json!({})),
+        exec_output(
+            "c1",
+            &[
+                "Script completed\nWall time 1.0 seconds\nOutput:\n",
+                &chunk(0, "done\n"),
+                &chunk(1, "ps: operation not permitted\n"),
+                &chunk(2, "gone\n"),
+            ],
+        ),
+    ]);
+    let cell = calls(&s)[0];
+    assert_eq!(cell.status, ToolStatus::Ok);
+    let kids: Vec<_> = cell.children.iter().map(|c| c.status).collect();
+    assert_eq!(kids, [ToolStatus::Ok, ToolStatus::Error, ToolStatus::Error]);
+    // The recorded command stays first, untouched; the others are read from the chunks.
+    assert_eq!(cell.children[0].id, "e1");
+    let refused = &cell.children[1];
+    let Tool::Shell(sh) = &refused.tool else {
+        panic!("{:?}", refused.tool)
+    };
+    assert_eq!(
+        (sh.command.as_str(), sh.cwd.as_deref(), sh.timeout_ms),
+        ("ps -ax\n", Some("/w"), Some(5000))
+    );
+    assert_eq!(
+        (shell(refused).exit_code, shell(refused).duration_ms),
+        (Some(1), Some(500))
+    );
+    assert_eq!(
+        shell(refused).stdout.as_deref(),
+        Some("ps: operation not permitted\n")
+    );
+    let poll = &cell.children[2];
+    assert!(matches!(
+        &poll.tool,
+        Tool::Process { id: Some(id), action: ProcessAction::Read, .. } if id == "9"
+    ));
+    assert_eq!(
+        (shell(poll).exit_code, shell(poll).duration_ms),
+        (Some(2), None)
+    );
+}
+
+#[test]
+fn the_same_command_twice_pairs_each_call_with_its_own_result() {
+    let script = "text(await tools.exec_command({cmd:\"make\"}));\n\
+        text(await tools.exec_command({cmd:\"make\"}));\n";
+    let out = exec_output(
+        "c1",
+        &[
+            "Script completed\nWall time 1.0 seconds\nOutput:\n",
+            &chunk(1, "refused\n"),
+            &chunk(0, "done\n"),
+        ],
+    );
+    let pair = |s: &Session| {
+        let kids = &calls(s)[0].children;
+        let ids: Vec<_> = kids.iter().map(|c| c.id.clone()).collect();
+        let exits: Vec<_> = kids.iter().map(|c| shell(c).exit_code).collect();
+        (ids, exits)
+    };
+    // The item is recorded in the cell: call 1 was refused, call 2 ran.
+    let s = session(&[
+        script_call("c1", script),
+        command_item("e1", "agent", json!({})),
+        out.clone(),
+    ]);
+    let (ids, exits) = pair(&s);
+    assert_eq!(
+        (ids, exits),
+        (
+            ["c1#0", "e1"].map(String::from).to_vec(),
+            vec![Some(1), Some(0)]
+        )
+    );
+    // The item is recorded after the output.
+    let s = session(&[
+        script_call("c1", script),
+        out,
+        command_item("e1", "unified_exec_startup", json!({})),
+    ]);
+    let (ids, exits) = pair(&s);
+    assert_eq!(
+        (ids, exits),
+        (
+            ["c1#0", "e1"].map(String::from).to_vec(),
+            vec![Some(1), Some(0)]
+        )
+    );
+}
+
+#[test]
+fn a_cut_chunk_still_gives_its_exit_code() {
+    let cut = |tail: &str| {
+        let text = format!(
+            "Warning: truncated output (original token count: 99)\nTotal output lines: 2\n\n{tail}"
+        );
+        let s = session(&[
+            script_call("c1", "text(await tools.exec_command({cmd:\"make\"}));"),
+            exec_output(
+                "c1",
+                &["Script completed\nWall time 1.0 seconds\nOutput:\n", &text],
+            ),
+        ]);
+        calls(&s)[0].children.clone()
+    };
+    let kids = cut(
+        "{\"chunk_id\":\"a\",\"wall_time_seconds\":0.1,\"exit_code\":3,\"original_token_count\":99,\"output\":\"cut \\\"exit_code\\\":0 he",
+    );
+    assert_eq!(kids.len(), 1);
+    assert_eq!(
+        (kids[0].status, shell(&kids[0]).exit_code),
+        (ToolStatus::Error, Some(3))
+    );
+    assert_eq!(shell(&kids[0]).stdout, None);
+    assert!(cut("{\"chunk_id\":\"a\",\"wall_ti").is_empty());
+}
+
+#[test]
+fn a_script_that_is_not_plain_calls_is_left_alone() {
+    let s = session(&[
+        script_call(
+            "c1",
+            "for (const c of cmds) text(await tools.exec_command({cmd:c}));",
+        ),
+        exec_output(
+            "c1",
+            &[
+                "Script completed\nWall time 1.0 seconds\nOutput:\n",
+                &chunk(1, "x"),
+            ],
+        ),
+        script_call("c2", "text(await tools.exec_command({cmd:\"a\"}));"),
+        exec_output(
+            "c2",
+            &[
+                "Script completed\nWall time 1.0 seconds\nOutput:\n",
+                "{\"chunk_id\":\"a\",\"session_id\":7,\"output\":\"\"}",
+            ],
+        ),
+    ]);
+    assert!(calls(&s).iter().all(|c| c.children.is_empty()));
+}
+
+#[test]
+fn a_command_item_after_its_cell_joins_that_cell() {
+    let script = "text(await tools.exec_command({cmd:\"make\"}));";
+    let s = session(&[
+        script_call("c1", script),
+        exec_output(
+            "c1",
+            &[
+                "Script completed\nWall time 1.0 seconds\nOutput:\n",
+                &chunk(0, "done\n"),
+            ],
+        ),
+        // The item lands after the output: it replaces the child read from the chunk.
+        command_item("e1", "unified_exec_startup", json!({"process_id": "77"})),
+        script_call("c2", script),
+        exec_output("c2", &["aborted by user after 0.5s"]),
+        rec(
+            "event_msg",
+            json!({"type": "turn_aborted", "turn_id": "t1", "reason": "interrupted"}),
+        ),
+        command_item("e2", "unified_exec_startup", json!({"process_id": "78"})),
+        // No script runs this command: it stays an orphan result.
+        command_item(
+            "e3",
+            "unified_exec_startup",
+            json!({"process_id": "79", "command": ["bash", "-c", "other"]}),
+        ),
+    ]);
+    let all = calls(&s);
+    let ids = |c: &ToolCall| c.children.iter().map(|k| k.id.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        (all[0].status, ids(all[0])),
+        (ToolStatus::Ok, vec!["e1".to_owned()])
+    );
+    assert_eq!(shell(&all[0].children[0]).duration_ms, Some(3000));
+    assert_eq!(
+        (all[1].status, ids(all[1])),
+        (ToolStatus::Interrupted, vec!["e2".to_owned()])
+    );
+    let orphans = messages(&s, Role::User, Origin::Tool);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(s.warnings.len(), 1);
+}
+
+#[test]
+fn an_agent_message_without_a_payload_makes_no_entry() {
+    let agent = |text: &str, extra: Vec<Value>| {
+        let mut content = vec![json!({"type": "input_text", "text": text})];
+        content.extend(extra);
+        rec(
+            "response_item",
+            json!({"type": "agent_message", "author": "/root/a", "content": content}),
+        )
+    };
+    let header = "Message Type: MESSAGE\nTask name: /root\nSender: /root/a\nPayload:\n";
+    let s = session(&[
+        agent(header, vec![]),
+        agent(&format!("{header}go on"), vec![]),
+        agent(
+            header,
+            vec![json!({"type": "encrypted_content", "encrypted_content": "gAAAAAB0ZmFrZQ=="})],
+        ),
+    ]);
+    let got = messages(&s, Role::User, Origin::Agent);
+    assert_eq!(got.len(), 2);
+    assert!(got[0].text().ends_with("go on"));
+    assert_eq!(got[1].kind.as_deref(), Some("MESSAGE"));
+}
+
 fn usage_record(response: &str, thread_total: u64) -> Value {
     let usage = json!({"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 10,
         "reasoning_output_tokens": 0, "total_tokens": 110});

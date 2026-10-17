@@ -1,7 +1,8 @@
 //! What a tool output, a completion event or a tool item says about the call.
 
+use super::js;
 use super::messages::{content_part, texts};
-use super::tools::{argv_shell, web_item};
+use super::tools::{argv_shell, exit_of, same_command, tool_for, web_item};
 use super::{PERSIST_CUT, TRUNCATED, Times};
 use crate::util::{
     Obj, base64_len, bool_field, diff_stat, file_url_path, obj_str, str_field, stripped, take_str,
@@ -37,7 +38,12 @@ pub(super) fn push_data(out: &mut ToolOutput, v: Value) {
     });
 }
 
-pub(super) fn fill_output(call: &mut ToolCall, body: Value, ts: Option<i64>) -> Answer {
+pub(super) fn fill_output(
+    call: &mut ToolCall,
+    body: Value,
+    ts: Option<i64>,
+    cwd: Option<String>,
+) -> Answer {
     let (items, attachments) = body_items(body);
     let text = join_items(&items);
     call.ended_at = ts.or(call.ended_at);
@@ -50,8 +56,8 @@ pub(super) fn fill_output(call: &mut ToolCall, body: Value, ts: Option<i64>) -> 
         out.text.push_str(&text);
     }
     match &call.tool {
-        Tool::Code { .. } => cell_answer(call, &items),
-        Tool::Process { .. } if call.name == "wait" => cell_answer(call, &items),
+        Tool::Code { .. } => cell_answer(call, &items, cwd),
+        Tool::Process { .. } if call.name == "wait" => cell_answer(call, &items, cwd),
         Tool::Shell(_) | Tool::Process { .. } => shell_answer(call, &text),
         Tool::Patch { patch } => {
             let files = patch::parse(patch);
@@ -71,14 +77,16 @@ pub(super) fn fill_output(call: &mut ToolCall, body: Value, ts: Option<i64>) -> 
 /// `text()` call; an exec_command result that is still running has `session_id`, no `exit_code`.
 /// A cell is not a shell, so its wall time, yielded cell id and still-running process ids go to
 /// `data` (a later delivery overwrites them).
-fn cell_answer(call: &mut ToolCall, items: &[String]) -> Answer {
+fn cell_answer(call: &mut ToolCall, items: &[String], cwd: Option<String>) -> Answer {
     let cell = read_cell(items);
     if let Some((status, detail)) = &cell.status {
         call.status = *status;
         call.status_detail = Some(detail.clone());
     } else if call.status == ToolStatus::Pending {
-        call.status = ToolStatus::Ok;
+        // No header: the plain text of an aborted or declined cell.
+        call.status = items.first().map_or(ToolStatus::Ok, |t| text_status(t));
     }
+    unrecorded_commands(call, items, cell.status.is_some(), cwd);
     if cell.error {
         call.status = ToolStatus::Error;
     }
@@ -105,6 +113,108 @@ fn cell_answer(call: &mut ToolCall, items: &[String]) -> Answer {
         cell_id: cell.cell_id,
         running: cell.running,
         exit: None,
+    }
+}
+
+/// What a script printed for an `exec_command` or `write_stdin` call that finished:
+/// `{"chunk_id", "wall_time_seconds", "exit_code", "output"}`. One that is still running has a
+/// `session_id` and no `exit_code`.
+struct Chunk {
+    exit: i32,
+    wall_ms: Option<u64>,
+    output: Option<String>,
+}
+
+fn finished_chunk(printed: &str) -> Option<Chunk> {
+    let json = (printed.find('{')).and_then(|i| serde_json::from_str::<Value>(&printed[i..]).ok());
+    if let Some(chunk) = json {
+        let exit = i32::try_from(chunk.get("exit_code")?.as_i64()?).ok()?;
+        let wall = chunk.get("wall_time_seconds").and_then(Value::as_f64);
+        return Some(Chunk {
+            exit,
+            wall_ms: wall.map(|s| (s * 1000.0).round() as u64),
+            output: str_field(&chunk, &["output"]),
+        });
+    }
+    // A cut chunk (`Warning: truncated output` and part of the JSON gone) still has its code:
+    // a quote inside the output is escaped, so this key text only matches the key itself.
+    let rest = &printed[printed.find("\"exit_code\":")? + "\"exit_code\":".len()..];
+    let rest = rest.trim_start();
+    let digits = rest.strip_prefix('-').unwrap_or(rest);
+    let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let end = rest.len() - digits.len() + len;
+    Some(Chunk {
+        exit: rest[..end].parse().ok()?,
+        wall_ms: None,
+        output: None,
+    })
+}
+
+/// A command Codex refuses before it starts (sandbox policy) leaves no `CommandExecution` item,
+/// so the cell's printed chunk is its only trace. Each such chunk becomes a child call, placed
+/// after the recorded child of the call before it. The calls come from the script and pair with
+/// the printed items by position, so a script with any other statement is left alone.
+fn unrecorded_commands(call: &mut ToolCall, items: &[String], headed: bool, cwd: Option<String>) {
+    let Tool::Code { source } = &call.tool else {
+        return;
+    };
+    let Some(calls) = js::invocations(source).filter(|_| headed) else {
+        return;
+    };
+    let mut printed = items.get(1..).unwrap_or_default();
+    if let Some((last, rest)) = printed.split_last() {
+        if last.starts_with("Script error:") {
+            printed = rest;
+        }
+    }
+    // A finished cell printed one item per call, a cut one fewer.
+    if printed.len() > calls.len() || (printed.len() < calls.len() && call.status == ToolStatus::Ok)
+    {
+        return;
+    }
+    let mut taken = vec![false; call.children.len()];
+    let (mut anchor, mut fresh) = (0, Vec::new());
+    for (i, ((name, arg), text)) in calls.into_iter().zip(printed).enumerate() {
+        if !matches!(name.as_str(), "exec_command" | "write_stdin") {
+            continue;
+        }
+        let tool = tool_for(&name, &arg, cwd.clone());
+        let chunk = finished_chunk(text);
+        // A recorded item is this call's when it ran the same command and ended the same way
+        // (the same command twice can have one call refused and one run).
+        let recorded = (call.children.iter().enumerate()).position(|(j, c)| {
+            let ended = chunk.as_ref().zip(exit_of(c));
+            !taken[j] && same_command(&c.tool, &tool) && ended.is_none_or(|(k, e)| k.exit == e)
+        });
+        if let Some(j) = recorded {
+            (taken[j], anchor) = (true, j + 1);
+            continue;
+        }
+        let Some(chunk) = chunk else {
+            continue;
+        };
+        let exit = Some(chunk.exit);
+        let shell = ShellResult {
+            exit_code: exit,
+            stdout: chunk.output,
+            // A poll's wall time is how long it waited, not how long the command ran.
+            duration_ms: chunk.wall_ms.filter(|_| matches!(tool, Tool::Shell(_))),
+            ..Default::default()
+        };
+        fresh.push((
+            anchor,
+            ToolCall {
+                status: exec_status(None, exit),
+                output: Some(ToolOutput {
+                    shell: Some(shell),
+                    ..Default::default()
+                }),
+                ..ToolCall::new(format!("{}#{i}", call.id), name, arg, tool)
+            },
+        ));
+    }
+    for (at, child) in fresh.into_iter().rev() {
+        call.children.insert(at, child);
     }
 }
 

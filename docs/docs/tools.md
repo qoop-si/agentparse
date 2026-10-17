@@ -85,6 +85,8 @@ Gemini CLI MCP names have a known limit: server names may contain `_`, so the sp
 
 A child call inside a Codex cell has `name` set to the item type (such as `CommandExecution`) and `input` set to null. The completion event is in `output.data`.
 
+A cell status is the cell's own: a script that ran a failing command still has status `Ok` (`Script completed`). Look at the children for exit codes. A command the sandbox refused leaves no item, so its child is read from the cell's printed chunk and has `name` `exec_command` (or `write_stdin`), the call's argument as `input`, and an id of `<cell id>#<n>`. Known limit: a `write_stdin` poll is always read from its chunk, even when the command it polls also has a recorded `Shell` child, so the same run can show as a `Process` and a `Shell` child. See [Codex](#codex).
+
 ## Changed files
 
 Calls that change files fill `output.files` with one `FileChange` per file.

@@ -186,6 +186,10 @@ impl Parser {
         let own = author.as_deref() == Some(self.own_path.as_str());
         if !own {
             self.close_group();
+            // A header with nothing after `Payload:` and no encrypted body says nothing.
+            if matches!(parts.as_slice(), [Part::Text { text }] if bare_header(text)) {
+                return;
+            }
         }
         // This session's own message to another agent is model output; a received one is input.
         let mut m = if own {
@@ -572,6 +576,13 @@ fn sniff(text: &str) -> Option<String> {
     let wrapped =
         tag.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') && t.contains(&format!("</{tag}"));
     (known && wrapped).then(|| tag.to_owned())
+}
+
+fn bare_header(text: &str) -> bool {
+    text.starts_with("Message Type: ")
+        && text
+            .split_once("Payload:")
+            .is_some_and(|(_, payload)| payload.trim().is_empty())
 }
 
 /// `Message Type: NEW_TASK` header of an inter-agent message.
