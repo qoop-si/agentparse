@@ -260,6 +260,11 @@ fn build_call(mut raw: RawTool, cwd: Option<&str>) -> (ToolCall, Option<Value>) 
         Vec::new()
     };
     let status = tool_status(&raw, shell.as_ref(), interrupted);
+    let running = finished && status == ToolStatus::Pending;
+    let shell = shell.map(|s| ShellResult {
+        duration_ms: s.duration_ms.filter(|_| !running),
+        ..s
+    });
     let child_session = matches!(tool, Tool::Task { .. })
         .then(|| {
             take_str(&mut raw.metadata, "sessionId")
@@ -308,7 +313,7 @@ fn build_call(mut raw: RawTool, cwd: Option<&str>) -> (ToolCall, Option<Value>) 
         status_detail,
         output,
         started_at: raw.started,
-        ended_at: raw.ended,
+        ended_at: raw.ended.filter(|_| !running),
         child_session,
         children: Vec::new(),
     };
@@ -360,6 +365,8 @@ fn tool_status(raw: &RawTool, shell: Option<&ShellResult>, interrupted: bool) ->
     match raw.status.as_str() {
         "completed" if shell_interrupted => ToolStatus::Interrupted,
         "completed" if shell.is_some_and(ShellResult::failed) => ToolStatus::Error,
+        // A background job: the call only started it, a later completion row ends it.
+        "completed" if shell.is_some_and(|s| s.background_id.is_some()) => ToolStatus::Pending,
         "completed" => ToolStatus::Ok,
         "error" => {
             let kind = raw.error.as_ref().and_then(|e| e.kind.as_deref());
@@ -449,6 +456,10 @@ fn classify(name: &str, input: &Value, cwd: Option<&str>) -> Tool {
             agent_type: s(&["subagent_type", "agent"]),
         }),
         "question" => Some(Tool::Question),
+        "execute" => s(&["code"]).map(|source| Tool::Code { source }),
+        "update_goal_plan" => Some(Tool::Todo {
+            items: goal_phases(input),
+        }),
         "plan_enter" | "plan_exit" => Some(Tool::Plan),
         "skill" => Some(Tool::Skill {
             name: s(&["name", "id"]),
@@ -462,6 +473,19 @@ fn classify(name: &str, input: &Value, cwd: Option<&str>) -> Tool {
         _ => None,
     };
     typed.unwrap_or(Tool::Other)
+}
+
+/// The phases of a goal plan (`plan.phases[]`) as checklist items.
+fn goal_phases(input: &Value) -> Vec<TodoItem> {
+    let phases = input.pointer("/plan/phases").and_then(Value::as_array);
+    let item = |p: &Value| {
+        Some(TodoItem {
+            content: str_field(p, &["objective", "id"])?,
+            status: str_field(p, &["status"]),
+            priority: None,
+        })
+    };
+    phases.into_iter().flatten().filter_map(item).collect()
 }
 
 fn todo_items(input: &Value) -> Option<Vec<TodoItem>> {

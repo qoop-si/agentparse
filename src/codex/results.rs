@@ -150,6 +150,16 @@ fn finished_chunk(printed: &str) -> Option<Chunk> {
     })
 }
 
+/// `{"session_id", "output", ...}` printed for a command that is still running (no `exit_code`).
+fn running_chunk(printed: &str) -> Option<(String, Option<String>)> {
+    let chunk: Value = serde_json::from_str(&printed[printed.find('{')?..]).ok()?;
+    chunk.get("exit_code").is_none().then_some(())?;
+    Some((
+        str_field(&chunk, &["session_id"])?,
+        str_field(&chunk, &["output"]),
+    ))
+}
+
 /// A command Codex refuses before it starts (sandbox policy) leaves no `CommandExecution` item,
 /// so the cell's printed chunk is its only trace. Each such chunk becomes a child call, placed
 /// after the recorded child of the call before it. The calls come from the script and pair with
@@ -191,6 +201,25 @@ fn unrecorded_commands(call: &mut ToolCall, items: &[String], headed: bool, cwd:
             continue;
         }
         let Some(chunk) = chunk else {
+            // The process outlived the cell: a running child until its command item lands.
+            if let (true, Some((session, output))) = (name == "exec_command", running_chunk(text)) {
+                let shell = ShellResult {
+                    stdout: output,
+                    background_id: Some(session),
+                    ..Default::default()
+                };
+                let output = ToolOutput {
+                    shell: Some(shell),
+                    ..Default::default()
+                };
+                fresh.push((
+                    anchor,
+                    ToolCall {
+                        output: Some(output),
+                        ..ToolCall::new(format!("{}#{i}", call.id), name, arg, tool)
+                    },
+                ));
+            }
             continue;
         };
         let exit = Some(chunk.exit);
@@ -345,11 +374,18 @@ fn header_line(p: &mut Printed, line: &str) -> bool {
 fn shell_answer(call: &mut ToolCall, text: &str) -> Answer {
     let p = printed(text);
     if call.status == ToolStatus::Pending {
+        // A process that outlived its call keeps running: its exit ends the call (`process_exit`,
+        // or the command item).
+        let live = p.session.is_some() && matches!(call.tool, Tool::Shell(_));
         call.status = match p.exit {
             Some(0) => ToolStatus::Ok,
             Some(_) => ToolStatus::Error,
+            None if live => ToolStatus::Pending,
             None => text_status(text),
         };
+        if call.status == ToolStatus::Pending {
+            call.ended_at = None;
+        }
     }
     let plain_ok = call.status == ToolStatus::Ok;
     let out = output_mut(call);
@@ -551,8 +587,30 @@ pub(super) fn child_call(ty: &str, mut item: Obj, times: Times, cwd: Option<Stri
     };
     let mut call = tool_call(ty, &item, tool, times);
     call.status = item_status(&item);
+    if ty == "McpToolCall" {
+        mcp_fields(&mut call, &mut item);
+    }
     push_data(output_mut(&mut call), stripped(Value::Object(item)));
     call
+}
+
+/// An MCP item's `arguments` are the call's input and the text of its `result` the output text;
+/// both leave the data they were read from.
+fn mcp_fields(call: &mut ToolCall, item: &mut Obj) {
+    call.input = item.remove("arguments").map_or(Value::Null, stripped);
+    // A call that never ran (approval policy) has an `error` and no result.
+    if let Some(message) = item.get("error").and_then(|e| str_field(e, &["message"])) {
+        output_mut(call).text = message;
+    }
+    let Some(Value::Object(result)) = item.get_mut("result") else {
+        return;
+    };
+    if let Some(content) = result.remove("content") {
+        let (items, attachments) = body_items(content);
+        let out = output_mut(call);
+        out.text = join_items(&items);
+        out.attachments = attachments;
+    }
 }
 
 fn tool_call(name: &str, item: &Obj, tool: Tool, times: Times) -> ToolCall {

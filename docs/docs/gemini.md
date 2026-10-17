@@ -46,7 +46,7 @@ Snapshots and rewinds make messages leave the active conversation. agentparse st
 
 | Source | Becomes |
 |---|---|
-| `user` record typed by a person | `Message` with origin `Human` |
+| `user` record typed by a person | `Message` with origin `Human`. A prompt with `@file` mentions has the text as typed in `displayContent`: that is the message, and the expanded `content` moves to `extra` |
 | `user` record starting with `<session_context>` | `Message` with origin `Context` and `kind: "session_context"` |
 | `user` record starting with `<hook_context>` | `Message` with origin `Context` and `kind: "hook_context"` |
 | A slash command such as `/help` | `Message` with origin `Command` and `kind: "slash_command"` |
@@ -54,7 +54,7 @@ Snapshots and rewinds make messages leave the active conversation. agentparse st
 | `gemini` record | One assistant `Message` per record, with thoughts, text and tool calls |
 | Echo `user` turns that only hold tool responses | Folded into the matching call. They are not user messages |
 | A tool response whose call is not in the file | A message with origin `Tool` holding `Part::ToolResult`, plus a warning |
-| `info`, `warning` records | `Notice` |
+| `info`, `warning` records | `Notice`. An `info` with no text (the compression marker) is dropped |
 | `error` record | `Error` |
 | Messages removed by `$rewindTo`, `$patch` or a snapshot | Stay in place, plus a `Rewind` entry |
 | Subagent file, first user turn | Origin `Agent` instead of `Human` |

@@ -337,7 +337,8 @@ impl Parser {
                     "HookPrompt" => self.hook_prompt(item),
                     "ContextCompaction" => self.fold_compaction(&ty, item),
                     "SubAgentActivity" | "CollabAgentToolCall" | "FunctionCallOutput" => {
-                        match id.and_then(|id| self.calls.get(&id)).copied() {
+                        let by_id = id.and_then(|id| self.calls.get(&id)).copied();
+                        match by_id.or_else(|| self.spawn_of(&ty, &item)) {
                             Some(r) => self.enrich(r, &ty, with_type(item, &ty)),
                             None => self.other(&ty, item),
                         }
@@ -587,6 +588,7 @@ impl Parser {
             status: Some(status),
             duration_ms,
             error,
+            ..Default::default()
         });
         match (aborted, self.abort.take()) {
             (true, Some(i)) => {
@@ -718,6 +720,7 @@ impl Parser {
             return Err(Error::NotASession("no Codex rollout records".into()));
         }
         self.close_group();
+        self.running_children();
         let format = if !self.enveloped {
             "codex-flat"
         } else if self.paginated {

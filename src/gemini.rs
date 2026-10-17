@@ -190,6 +190,13 @@ impl<'a> CallSrc<'a> {
     }
 }
 
+/// A user record's `displayContent`: the prompt as typed, when it has text.
+fn typed(rec: &Obj) -> Option<&Value> {
+    let shown = rec.get("displayContent")?;
+    let text = |p: &part::P<'_>| p.text().is_some_and(|t| !t.trim().is_empty());
+    norm(Some(shown)).iter().any(text).then_some(shown)
+}
+
 fn record_type(rec: &Rec) -> &str {
     rec.value.get("type").and_then(Value::as_str).unwrap_or("")
 }
@@ -257,8 +264,12 @@ impl<'a> Build<'a> {
     fn message(&mut self, slot: usize, id: &str, rec: &'a Rec) {
         let kind = record_type(rec);
         let model = kind == "gemini";
+        // A prompt typed with `@file` mentions keeps its expansion (`content`) in `extra`.
+        let typed = kind == "user" && typed(&rec.value).is_some();
         let extra = unmapped(&rec.value, |k| {
-            RECORD_KEYS.contains(&k) || (model && MODEL_KEYS.contains(&k))
+            (RECORD_KEYS.contains(&k) && !(typed && k == "content"))
+                || (typed && k == "displayContent")
+                || (model && MODEL_KEYS.contains(&k))
         });
         match kind {
             "user" => self.user(slot, id, rec, extra),
@@ -294,6 +305,15 @@ impl<'a> Build<'a> {
     fn notice(&mut self, id: &str, rec: &Rec, extra: Option<Value>) {
         let level = Some(record_type(rec).to_string());
         let text = join_text(rec.value.get("content"));
+        let files: Vec<Part> = norm(rec.value.get("content"))
+            .into_iter()
+            .filter_map(media)
+            .map(Part::Attachment)
+            .collect();
+        // The compression marker is recorded as an `info` with no text.
+        if text.trim().is_empty() && files.is_empty() {
+            return;
+        }
         self.push(
             id,
             rec,
@@ -304,11 +324,6 @@ impl<'a> Build<'a> {
                 text,
             }),
         );
-        let files: Vec<Part> = norm(rec.value.get("content"))
-            .into_iter()
-            .filter_map(media)
-            .map(Part::Attachment)
-            .collect();
         if !files.is_empty() {
             let kind = EntryKind::Message(Message {
                 kind: Some("binary_injection".into()),
@@ -348,7 +363,7 @@ impl<'a> Build<'a> {
     }
 
     fn user_groups(&mut self, slot: usize, rec: &Rec) -> Vec<Group> {
-        let content = norm(rec.value.get("content"));
+        let content = norm(typed(&rec.value).or_else(|| rec.value.get("content")));
         let has_response = content.iter().any(|p| p.function_response().is_some());
         let mut orphans: Vec<Part> = content
             .iter()

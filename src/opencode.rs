@@ -30,7 +30,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use v1::v1_entries;
-use v2::v2_entries;
+use v2::{v2_entries, v2_pending};
 
 type Map = serde_json::Map<String, Value>;
 
@@ -150,6 +150,10 @@ pub fn parse_db(db: &Path, session_id: &str) -> Result<Session> {
 
     let mut entries = v1_entries(v1_messages);
     entries.extend(v2_entries(v2_rows));
+    if has_v2 {
+        entries.extend(v2_pending(load_pending(&conn, session_id)?));
+    }
+    link_running_children(&mut entries, &children_of(&conn, session_id)?);
     entries.extend(todos_entry(&conn, session_id)?);
 
     let mut session = Session::new(
@@ -232,6 +236,45 @@ pub(crate) fn parse_storage_file(path: &Path) -> Result<Session> {
     session.entries = entries;
     session.warnings = warnings;
     Ok(finish_session(session))
+}
+
+/// A subagent call that is still running has no `sessionID` in its state yet; its child is the
+/// session of this parent titled with the call's description, the first not linked to a call.
+fn link_running_children(entries: &mut [Entry], children: &[(String, String)]) {
+    let mut taken: HashSet<String> = HashSet::new();
+    for_each_call(entries, &mut |c| taken.extend(c.child_session.clone()));
+    for_each_call(entries, &mut |call| {
+        let Tool::Task {
+            description: Some(d),
+            ..
+        } = &call.tool
+        else {
+            return;
+        };
+        if call.status != ToolStatus::Pending || call.child_session.is_some() {
+            return;
+        }
+        let titled = |title: &str| title == d || title.starts_with(&format!("{d} (@"));
+        let found = children
+            .iter()
+            .find(|(id, title)| !taken.contains(id) && titled(title));
+        if let Some((id, _)) = found {
+            taken.insert(id.clone());
+            call.child_session = Some(id.clone());
+        }
+    });
+}
+
+fn for_each_call(entries: &mut [Entry], f: &mut dyn FnMut(&mut ToolCall)) {
+    for entry in entries {
+        if let EntryKind::Message(m) = &mut entry.kind {
+            for part in &mut m.parts {
+                if let Part::ToolCall(call) = part {
+                    f(call);
+                }
+            }
+        }
+    }
 }
 
 /// Everything that needs the whole session: a child's first prompt comes from another agent

@@ -479,7 +479,7 @@ fn subagent_parent_links_its_child() {
             others(&s, "SubAgentActivity"),
             others(&s, "inter_agent_communication_metadata")
         ),
-        (1, 2)
+        (0, 2)
     );
     assert_eq!(s.usage, usage(7000, 26800, 260, 40));
     assert!(s.parent.is_none());
@@ -1447,7 +1447,16 @@ fn a_script_that_is_not_plain_calls_is_left_alone() {
             ],
         ),
     ]);
-    assert!(calls(&s).iter().all(|c| c.children.is_empty()));
+    let cs = calls(&s);
+    assert!(cs[0].children.is_empty());
+    // A chunk of a command that is still running is a running child, whatever else the script does.
+    let [child] = cs[1].children.as_slice() else {
+        panic!()
+    };
+    assert_eq!(
+        (child.status, shell(child).background_id.as_deref()),
+        (ToolStatus::Pending, Some("7"))
+    );
 }
 
 #[test]
@@ -1882,17 +1891,17 @@ fn item_envelopes_keep_their_times() {
         .clone()
         .unwrap();
     assert_eq!(
-        (data["started_at_ms"].as_i64(), data["turn_id"].as_str()),
+        (
+            data[0]["started_at_ms"].as_i64(),
+            data[0]["turn_id"].as_str()
+        ),
         (
             Some(1791802801145),
             Some("019f1a11-0003-7000-8000-000000000003")
         )
     );
-    let done = parent.entries.iter().find_map(|e| match &e.kind {
-        EntryKind::Other(o) if o.kind == "SubAgentActivity" => Some(o.data.clone()),
-        _ => None,
-    });
-    assert_eq!(done.unwrap()["completed_at_ms"], 1791802810994_i64);
+    // The `completed` activity is the spawn call's second event.
+    assert_eq!(data[1]["completed_at_ms"], 1791802810994_i64);
 }
 
 #[test]
@@ -2042,4 +2051,327 @@ fn unmatched_legacy_event_keeps_its_own_time_and_line() {
         .flatten();
     assert_ne!(message.ts, complete_ts);
     assert!(message.line < s.entries.last().unwrap().line);
+}
+
+// Chat parity (running work, MCP and web rows, orphan output).
+
+fn function_call(id: &str, name: &str, arguments: Value) -> Value {
+    rec(
+        "response_item",
+        json!({"type": "function_call", "call_id": id, "name": name, "arguments": arguments.to_string()}),
+    )
+}
+
+fn function_output(id: &str, output: &str) -> Value {
+    rec(
+        "response_item",
+        json!({"type": "function_call_output", "call_id": id, "output": output}),
+    )
+}
+
+fn subagent_activity(id: &str, kind: &str, thread: &str) -> Value {
+    item(
+        json!({"type": "SubAgentActivity", "id": id, "kind": kind, "agent_thread_id": thread,
+        "agent_path": "/root/review"}),
+    )
+}
+
+/// A spawned agent runs until its `completed` record, whose id is not the call's.
+#[test]
+fn a_spawned_agent_is_pending_until_its_child_completes() {
+    let spawn = |id: &str| {
+        function_call(
+            id,
+            "spawn_agent",
+            json!({"task_name": "review", "message": "x"}),
+        )
+    };
+    let out = |id: &str| function_output(id, "{\"task_name\":\"/root/review\"}");
+    let started = |id: &str, thread: &str| subagent_activity(id, "started", thread);
+    let done = |thread: &str| {
+        subagent_activity(&format!("subagent-completed-{thread}"), "completed", thread)
+    };
+    // The started record comes before the output in real files, and after it in older ones.
+    let s = session(&[
+        spawn("sp1"),
+        started("sp1", "kid1"),
+        out("sp1"),
+        spawn("sp2"),
+        out("sp2"),
+        started("sp2", "kid2"),
+        spawn("sp3"),
+        started("sp3", "kid3"),
+        out("sp3"),
+        done("kid3"),
+        done("kid1"),
+    ]);
+    let got: Vec<_> = calls(&s)
+        .iter()
+        .map(|c| (c.status, c.status_detail.as_deref(), c.ended_at))
+        .collect();
+    use ToolStatus::*;
+    assert_eq!(
+        got,
+        [
+            (Ok, Some("completed"), Some(2)),
+            (Pending, None, None),
+            (Ok, Some("completed"), Some(2)),
+        ]
+    );
+    assert_eq!(others(&s, "SubAgentActivity"), 0);
+    // Without any completion every started child is still running.
+    let s = session(&[spawn("sp1"), started("sp1", "kid1"), out("sp1")]);
+    assert_eq!(calls(&s)[0].status, ToolStatus::Pending);
+    // A spawn whose child never started has nothing to wait for.
+    let s = session(&[spawn("sp1"), out("sp1")]);
+    assert_eq!(calls(&s)[0].status, ToolStatus::Ok);
+}
+
+/// `exec_command` that outlives its call: Pending with its session until the process ends.
+#[test]
+fn a_background_exec_command_is_pending_until_its_process_ends() {
+    let start = [
+        function_call("x1", "exec_command", json!({"cmd": "bun run dev"})),
+        function_output(
+            "x1",
+            "Chunk ID: a\nWall time: 1.0 seconds\nProcess running with session ID 4242\nOriginal token count: 0\nOutput:\nlistening\n",
+        ),
+    ];
+    let poll = |exit_line: &str| {
+        [
+            function_call("w1", "write_stdin", json!({"session_id": 4242})),
+            function_output(
+                "w1",
+                &format!(
+                    "Chunk ID: b\nWall time: 0.5 seconds\n{exit_line}\nOriginal token count: 0\nOutput:\n"
+                ),
+            ),
+        ]
+    };
+    let run = |more: &[Value]| {
+        let mut records = start.to_vec();
+        records.extend(more.iter().cloned());
+        session(&records)
+    };
+    let s = run(&[]);
+    let c = calls(&s)[0];
+    assert_eq!(
+        (c.status, c.ended_at, shell(c).background_id.as_deref()),
+        (ToolStatus::Pending, None, Some("4242"))
+    );
+    assert_eq!(shell(c).stdout.as_deref(), Some("listening\n"));
+    // A poll that sees it still running is no running call itself.
+    let s = run(&poll("Process running with session ID 4242"));
+    assert_eq!(
+        calls(&s).iter().map(|c| c.status).collect::<Vec<_>>(),
+        [ToolStatus::Pending, ToolStatus::Ok]
+    );
+    // A poll that sees it exit ends it.
+    let s = run(&poll("Process exited with code 0"));
+    assert_eq!(
+        (calls(&s)[0].status, shell(calls(&s)[0]).exit_code),
+        (ToolStatus::Ok, Some(0))
+    );
+    let s = run(&poll("Process exited with code 3"));
+    assert_eq!(
+        (calls(&s)[0].status, shell(calls(&s)[0]).exit_code),
+        (ToolStatus::Error, Some(3))
+    );
+    // Its command item ends it at the item's time.
+    let s = run(&[command_item(
+        "e1",
+        "unified_exec_startup",
+        json!({"process_id": "4242"}),
+    )]);
+    let c = calls(&s)[0];
+    assert_eq!(
+        (c.status, shell(c).exit_code, c.ended_at),
+        (ToolStatus::Ok, Some(0), Some(2))
+    );
+}
+
+/// A cell whose script started a command that is still running has that command as a running
+/// child; the command item replaces it when the process ends.
+#[test]
+fn a_cell_with_a_live_process_has_a_running_child() {
+    let script = "text(await tools.exec_command({cmd:\"bun run dev\",yield_time_ms:1000}));";
+    let head = "Script completed\nWall time 1.0 seconds\nOutput:\n";
+    let live = "{\"chunk_id\":\"a\",\"session_id\":82,\"output\":\"ready\"}";
+    let records = [script_call("c1", script), exec_output("c1", &[head, live])];
+    let s = session(&records);
+    let cell = calls(&s)[0];
+    assert_eq!(cell.status, ToolStatus::Ok);
+    let [child] = cell.children.as_slice() else {
+        panic!("{:?}", cell.children)
+    };
+    assert_eq!(
+        (
+            command(child),
+            child.status,
+            shell(child).background_id.as_deref()
+        ),
+        ("bun run dev", ToolStatus::Pending, Some("82"))
+    );
+    assert_eq!(shell(child).stdout.as_deref(), Some("ready"));
+    let mut later = records.to_vec();
+    later.push(command_item(
+        "e1",
+        "unified_exec_startup",
+        json!({"process_id": "82", "command": ["bash", "-c", "bun run dev"]}),
+    ));
+    let s = session(&later);
+    let [child] = calls(&s)[0].children.as_slice() else {
+        panic!()
+    };
+    assert_eq!(
+        (child.status, shell(child).exit_code),
+        (ToolStatus::Ok, Some(0))
+    );
+}
+
+/// A command item that no call or cell owns keeps its output as the result text.
+#[test]
+fn an_orphan_command_item_keeps_its_output() {
+    let s = session(&[command_item(
+        "o1",
+        "unified_exec_startup",
+        json!({"process_id": "77"}),
+    )]);
+    let results: Vec<_> = s
+        .messages()
+        .flat_map(|m| &m.parts)
+        .filter_map(|p| match p {
+            Part::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    let [r] = results.as_slice() else { panic!() };
+    assert_eq!(
+        (r.output.text.as_str(), r.status),
+        ("done\n", ToolStatus::Ok)
+    );
+    assert_eq!(
+        r.output.data.as_ref().unwrap()["command"],
+        json!(["bash", "-c", "make"])
+    );
+}
+
+/// MCP items keep their arguments and the text of their result; web items name their page.
+#[test]
+fn mcp_and_web_items_say_what_they_did() {
+    let mcp = item(
+        json!({"type": "McpToolCall", "id": "m1", "server": "codex_apps", "tool": "acme.fetch",
+        "arguments": {"url": "https://example.com"}, "status": "completed",
+        "result": {"content": [{"type": "text", "text": "page body"}], "isError": false}}),
+    );
+    let web = |id: &str, query: &str, action: Value| {
+        item(
+            json!({"type": "Extension", "kind": "web.search", "id": id, "query": query, "action": action,
+            "results": [{"type": "text_result", "url": "https://example.com/doc", "title": "Doc"}]}),
+        )
+    };
+    let s = session(&[
+        exec_call("c1"),
+        mcp,
+        item(
+            json!({"type": "McpToolCall", "id": "m2", "server": "codex_apps", "tool": "acme.fetch",
+            "arguments": {}, "status": "failed", "error": {"message": "needs approval"}}),
+        ),
+        web(
+            "w1",
+            "'needle'",
+            json!({"type": "findInPage", "url": null, "pattern": "needle"}),
+        ),
+        web("w2", "", json!({"type": "other"})),
+        web(
+            "w3",
+            "rust docs",
+            json!({"type": "search", "query": null, "queries": ["rust docs", "x"]}),
+        ),
+        web(
+            "w4",
+            "https://a.dev",
+            json!({"type": "openPage", "url": "https://a.dev"}),
+        ),
+        exec_output(
+            "c1",
+            &["Script completed\nWall time 1.0 seconds\nOutput:\n"],
+        ),
+    ]);
+    let kids = &calls(&s)[0].children;
+    let m = &kids[0];
+    assert_eq!(m.input, json!({"url": "https://example.com"}));
+    let out = m.output.as_ref().unwrap();
+    assert_eq!(out.text, "page body");
+    assert!(out.data.as_ref().unwrap().get("arguments").is_none());
+    assert_eq!(out.data.as_ref().unwrap()["result"]["isError"], false);
+    assert_eq!(kids[1].output.as_ref().unwrap().text, "needs approval");
+    let tools: Vec<&Tool> = kids[2..].iter().map(|c| &c.tool).collect();
+    let page = Some("https://example.com/doc".to_string());
+    assert_eq!(
+        tools,
+        [
+            &Tool::WebFetch {
+                url: page.clone(),
+                prompt: Some("needle".into())
+            },
+            &Tool::WebFetch {
+                url: page,
+                prompt: None
+            },
+            &Tool::WebSearch {
+                query: Some("rust docs".into())
+            },
+            &Tool::WebFetch {
+                url: Some("https://a.dev".into()),
+                prompt: None
+            },
+        ]
+    );
+}
+
+/// A spawned child that never reported `completed` is running unless its own rollout, next to the
+/// parent's, shows its last turn ended.
+#[test]
+fn a_spawn_closes_when_the_childs_last_turn_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = |id: &str, ends: &[&str]| {
+        let lines: Vec<String> = ends
+            .iter()
+            .map(|t| json!({"type": "event_msg", "payload": {"type": t}}).to_string())
+            .collect();
+        let name = format!("rollout-2026-10-12T00-00-01-{id}.jsonl");
+        std::fs::write(dir.path().join(name), lines.join("\n")).unwrap();
+    };
+    child("kid-abort", &["task_started", "turn_aborted"]);
+    child("kid-done", &["task_started", "task_complete"]);
+    child("kid-busy", &["task_complete", "task_started"]);
+    let spawn = |n: &str| {
+        function_call(
+            &format!("sp-{n}"),
+            "spawn_agent",
+            json!({"task_name": n, "message": "x"}),
+        )
+    };
+    let mut records = Vec::new();
+    for n in ["abort", "done", "busy", "gone"] {
+        let id = format!("sp-{n}");
+        records.push(spawn(n));
+        records.push(subagent_activity(&id, "started", &format!("kid-{n}")));
+        records.push(function_output(&id, "{\"task_name\":\"/root/x\"}"));
+    }
+    let mut lines = vec![rec(
+        "session_meta",
+        json!({"id": "t1", "cwd": "/w", "history_mode": "paginated"}),
+    )];
+    lines.extend(records);
+    let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+    let source = Source::File {
+        path: dir.path().join("rollout-2026-10-12T00-00-00-parent.jsonl"),
+    };
+    let s = agentparse::parse_reader(Agent::Codex, text.join("\n").as_bytes(), source).unwrap();
+    let got: Vec<_> = calls(&s).iter().map(|c| c.status).collect();
+    use ToolStatus::*;
+    assert_eq!(got, [Interrupted, Ok, Pending, Pending]);
+    assert_eq!(calls(&s)[0].status_detail.as_deref(), Some("ended"));
 }

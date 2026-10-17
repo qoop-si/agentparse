@@ -47,7 +47,7 @@ A database from a 1.x version has an empty `session_v2` table. Such a session is
 |---|---|
 | `user` | A user `Message` |
 | `assistant` | A `Message` whose `content[]` of text, reasoning and tool blocks become parts |
-| `synthetic` | A `Message` with origin `Notification` or `Context`, by `metadata.source`. A background shell completion also enriches the call with the same `shellID` |
+| `synthetic` | A `Message` with origin `Notification` or `Context`, by `metadata.source`. A background shell completion also enriches the call with the same `shellID`: until it arrives the call that started the job is `Pending` without `ended_at` |
 | `system` | A `Message` with role `System` |
 | `skill` | A user `Message` with `kind: "skill"` |
 | `shell` | A `Command` message holding a `Shell` call. The call id is the `shellID` |
@@ -59,6 +59,9 @@ A database from a 1.x version has an empty `session_v2` table. Such a session is
 
 | Source | Becomes |
 |---|---|
+| `session_pending` rows (input typed while the session was busy) | A `Message` with `phase: "queued"` for type `user`, `Other` with `kind: "session_pending.<type>"` for the rest |
+| A `subagent` or `task` call that is still running | `child_session` from the child session of this parent whose title is the call's description (the call has no `sessionID` before it ends) |
+| `execute`, `update_goal_plan` | `Tool::Code` (the `code` input), `Tool::Todo` (one item per `plan.phases[]`). The other goal tools stay `Tool::Other` with their input |
 | `todo` table rows | One final `Other` entry with `kind: "todos"` |
 | Session row columns a field takes (`directory`, `title`, `version`, times) | `Session.cwd`, `title`, `cli_version`, `started_at`, `updated_at` |
 | Other session columns | `Session.extra`. JSON columns are parsed |

@@ -2,7 +2,7 @@
 
 use agentparse::{
     Agent, Entry, EntryKind, FileOp, Message, Origin, Part, ProcessAction, Role, Session,
-    ShellResult, Source, Tool, ToolCall, ToolStatus, Usage, parse_file, parse_file_tail,
+    ShellResult, Source, TodoItem, Tool, ToolCall, ToolStatus, Usage, parse_file, parse_file_tail,
     parse_reader,
 };
 use serde_json::{Value, json};
@@ -236,24 +236,34 @@ fn main_session_user_side() {
     assert_eq!(
         context,
         [
-            (Role::System, Some("file")),
             (Role::System, Some("total_tokens_reminder")),
             (Role::User, Some("local-command-caveat")),
             (Role::User, Some("meta")),
             (Role::User, Some("system-reminder")),
-            (Role::System, Some("compact_file_reference")),
         ]
     );
     let notes = user_texts(&s, Origin::Notification);
     assert_eq!(notes.len(), 2);
     assert!(notes.iter().all(|t| t.starts_with("<task-notification>")));
-    // The file mention keeps its metadata; the file body is not stored twice.
+    // The file mention and the compaction's file reference are one line each; the record keeps
+    // its metadata and the body once (the rendered copy that wraps it goes).
+    let EntryKind::Notice(n) = &at(&s, 4).kind else {
+        panic!()
+    };
+    assert_eq!(
+        (n.kind.as_deref(), n.text.as_str()),
+        (Some("file"), "Read test.sh (4 lines)")
+    );
     let file = at(&s, 4).extra.as_ref().unwrap();
     assert_eq!(file["attachment"]["displayPath"], "test.sh");
-    assert!(
-        file["attachment"]["content"]["file"]
-            .get("content")
-            .is_none()
+    assert!(file["attachment"]["content"]["file"]["content"].is_string());
+    assert!(file.get("rendered").is_none());
+    let EntryKind::Notice(n) = &at(&s, 85).kind else {
+        panic!()
+    };
+    assert_eq!(
+        (n.kind.as_deref(), n.text.as_str()),
+        (Some("compact_file_reference"), "Referenced file a.txt")
     );
     // No user message holds a tool result: all 18 folded into their calls.
     assert!(s.messages().all(|m| m.origin != Origin::Tool));
@@ -403,7 +413,16 @@ fn main_session_tool_calls() {
         None,
         "the list result equals the content"
     );
-    assert_eq!(call(&s, "toolu_01DemoTaskCreate12").tool, Tool::Other);
+    assert_eq!(
+        call(&s, "toolu_01DemoTaskCreate12").tool,
+        Tool::Todo {
+            items: vec![TodoItem {
+                content: "Check demo docs".into(),
+                status: Some("pending".into()),
+                priority: None
+            }]
+        }
+    );
 
     let agent = call(&s, "toolu_01DemoAgent14");
     assert!(
@@ -951,7 +970,7 @@ fn v2_1_rules() {
     let bg = call(&s, "toolu_bg");
     assert_eq!(
         (bg.status, bg.status_detail.as_deref()),
-        (ToolStatus::Ok, None),
+        (ToolStatus::Pending, None),
         "still running, never inferred"
     );
     assert_eq!(shell(bg).background_id.as_deref(), Some("b1"));
@@ -1324,7 +1343,7 @@ fn bash_result_objects() {
             shell(b4).timed_out,
             shell(b4).exit_code
         ),
-        (ToolStatus::Ok, Some("bg4"), false, None)
+        (ToolStatus::Pending, Some("bg4"), false, None)
     );
     assert_eq!(
         b4.output.as_ref().unwrap().data.as_ref().unwrap()["timedOutAfterMs"],
@@ -1752,5 +1771,764 @@ fn merged_lines_and_call_blocks_keep_their_own_keys() {
     assert_eq!(
         extra["calls"]["c1"]["call"]["caller"]["type"],
         "code_execution_20250825"
+    );
+}
+
+// Chat parity (background work, hooks, attachments, queued input).
+
+/// A prompt, one assistant message with these calls, and a launch result line for each:
+/// `(call id, tool name, input, toolUseResult)`.
+fn launched(calls: &[(&str, &str, Value, Value)]) -> Vec<Value> {
+    let blocks: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, input, _)| tool_use(id, name, input.clone()))
+        .collect();
+    let mut lines = vec![
+        prompt("u0", None, json!("go")),
+        reply("a1", Some("u0"), "msg_1", json!(blocks)),
+    ];
+    for (id, _, _, tur) in calls {
+        let content = json!("launched");
+        let uuid = format!("r-{id}");
+        lines.push(result(&uuid, id, content, false, tur.clone(), json!({})));
+    }
+    lines
+}
+
+fn async_agent(id: &'static str, agent_id: &str) -> (&'static str, &'static str, Value, Value) {
+    let input = json!({"description": "scan", "prompt": "p"});
+    let tur =
+        json!({"isAsync": true, "status": "async_launched", "agentId": agent_id, "prompt": "p"});
+    (id, "Agent", input, tur)
+}
+
+fn background_bash(id: &'static str, task: &str) -> (&'static str, &'static str, Value, Value) {
+    let input = json!({"command": "sleep 9", "run_in_background": true});
+    let tur = json!({"stdout": "", "stderr": "", "interrupted": false, "backgroundTaskId": task});
+    (id, "Bash", input, tur)
+}
+
+fn monitor(
+    id: &'static str,
+    input: Value,
+    task: &str,
+) -> (&'static str, &'static str, Value, Value) {
+    let mut base = json!({"command": "tail -f x", "description": "watch"});
+    base.as_object_mut()
+        .unwrap()
+        .extend(input.as_object().unwrap().clone());
+    (
+        id,
+        "Monitor",
+        base,
+        json!({"taskId": task, "timeoutMs": 600000, "persistent": false}),
+    )
+}
+
+fn workflow(id: &'static str, task: &str) -> (&'static str, &'static str, Value, Value) {
+    let tur =
+        json!({"status": "async_launched", "taskId": task, "runId": "wf_1", "summary": "Plan it"});
+    (
+        id,
+        "Workflow",
+        json!({"script": "export const meta = {}"}),
+        tur,
+    )
+}
+
+fn status_of(s: &Session, id: &str) -> (ToolStatus, Option<String>) {
+    let c = call(s, id);
+    (c.status, c.status_detail.clone())
+}
+
+fn at_time(mut v: Value, ts: &str) -> Value {
+    v["timestamp"] = json!(ts);
+    v
+}
+
+/// A launch is not an outcome: the call stays Pending, without an end time, until its task
+/// reports. The report finds its call by `<tool-use-id>` or, when it has none, by `<task-id>`.
+#[test]
+fn launches_stay_pending_until_a_notification_ends_them() {
+    let calls = [
+        background_bash("sh", "bg1"),
+        async_agent("ag", "agid"),
+        monitor("mon", json!({"timeout_ms": 600000}), "mid"),
+        workflow("wf", "wid"),
+        background_bash("st", "bg2"),
+        background_bash("dn", "bg3"),
+    ];
+    let launches = launched(&calls);
+    let s = transcript(&launches);
+    for id in ["sh", "ag", "mon", "wf", "st", "dn"] {
+        let c = call(&s, id);
+        assert_eq!((id, c.status, c.ended_at), (id, ToolStatus::Pending, None));
+    }
+    let wf = call(&s, "wf");
+    assert!(
+        matches!(&wf.tool, Tool::Task { description: Some(d), agent_type: Some(t), .. }
+        if d == "Plan it" && t == "workflow")
+    );
+    assert_eq!(wf.child_session, None);
+    assert_eq!(call(&s, "ag").child_session.as_deref(), Some("agid"));
+
+    // Notes that are not an end: a running status, a Monitor event, an agent that waits on its
+    // own background work.
+    let interim =
+        "This agent stopped with background work of its own still running. It may resume.";
+    let mut lines = launches.clone();
+    lines.extend([
+        notification("n1", "<task-id>bg2</task-id>\n<status>running</status>"),
+        notification("n2", "<task-id>mid</task-id>\n<summary>Monitor event: \"watch\"</summary>\n<event>tick</event>"),
+        notification(
+            "n3",
+            &format!("<task-id>agid</task-id>\n<status>completed</status>\n<summary>Agent \"scan\" is waiting on its own background work</summary>\n<note>{interim}</note>"),
+        ),
+    ]);
+    let s = transcript(&lines);
+    for id in ["ag", "mon", "st"] {
+        assert_eq!((id, call(&s, id).status), (id, ToolStatus::Pending));
+    }
+
+    // The ends: by call id, by task id alone, and the statuses `done` and `stopped`.
+    lines.extend([
+        notification("n4", "<task-id>bg1</task-id>\n<tool-use-id>sh</tool-use-id>\n<status>completed</status>\n<summary>Background command \"make\" completed (exit code 0)</summary>"),
+        notification("n5", "<task-id>agid</task-id>\n<status>completed</status>\n<summary>Agent \"scan\" completed</summary>"),
+        notification("n6", "<task-id>wid</task-id>\n<status>failed</status>\n<summary>Dynamic workflow failed</summary>"),
+        notification("n7", "<task-id>bg2</task-id>\n<tool-use-id>st</tool-use-id>\n<status>stopped</status>"),
+        notification("n8", "<task-id>bg3</task-id>\n<status>done</status>"),
+        notification("n9", "<task-id>mid</task-id>\n<summary>Monitor event: \"watch\"</summary>\n<event>[Monitor expired after 10m with no events delivered. Re-arm it.]</event>"),
+    ]);
+    let s = transcript(&lines);
+    use ToolStatus::*;
+    let got: Vec<_> = ["sh", "ag", "wf", "st", "dn", "mon"]
+        .iter()
+        .map(|id| {
+            (
+                call(&s, id).status,
+                call(&s, id).status_detail.clone().unwrap(),
+            )
+        })
+        .collect();
+    let want = [
+        (Ok, "completed"),
+        (Ok, "completed"),
+        (Error, "failed"),
+        (Interrupted, "stopped"),
+        (Ok, "done"),
+        (Ok, "expired"),
+    ];
+    assert_eq!(got, want.map(|(s, d)| (s, d.to_string())));
+    assert!(shell(call(&s, "st")).interrupted);
+    assert!(call(&s, "ag").ended_at.is_some());
+}
+
+/// What never reported still ends: a stop result, `agents_killed`, a turn that ends with none
+/// left, a Monitor that ran out its `timeout_ms`.
+#[test]
+fn records_of_the_harness_end_what_never_reported() {
+    let calls = [
+        async_agent("ag", "agid"),
+        workflow("wf", "wid"),
+        background_bash("sh", "bg1"),
+        monitor("m10", json!({"timeout_ms": 600000}), "m10id"),
+        monitor("mp", json!({"persistent": true}), "mpid"),
+    ];
+    let with = |extra: Vec<Value>| {
+        let mut lines = launched(&calls);
+        lines.extend(extra);
+        transcript(&lines)
+    };
+    let turn = |agents: u64, workflows: u64| {
+        line(
+            "system",
+            "t1",
+            None,
+            json!({"subtype": "turn_duration", "durationMs": 5,
+            "pendingBackgroundAgentCount": agents, "pendingWorkflowCount": workflows}),
+        )
+    };
+    let pending = |s: &Session| -> Vec<&str> {
+        ["ag", "wf", "sh", "m10", "mp"]
+            .into_iter()
+            .filter(|id| call(s, id).status == ToolStatus::Pending)
+            .collect()
+    };
+    // Something is still running: nothing ends.
+    assert_eq!(
+        pending(&with(vec![turn(1, 1)])),
+        ["ag", "wf", "sh", "m10", "mp"]
+    );
+    // None left: the agents end, the workflows only when their own count is zero.
+    let s = with(vec![turn(0, 2)]);
+    assert_eq!(pending(&s), ["wf", "sh", "m10", "mp"]);
+    assert_eq!(
+        status_of(&s, "ag"),
+        (ToolStatus::Interrupted, Some("ended".into()))
+    );
+    assert_eq!(pending(&with(vec![turn(0, 0)])), ["sh", "m10", "mp"]);
+    // All agents killed: agents and workflows, no shell or monitor.
+    let killed = line("system", "k1", None, json!({"subtype": "agents_killed"}));
+    let s = with(vec![killed]);
+    assert_eq!(pending(&s), ["sh", "m10", "mp"]);
+    assert_eq!(
+        status_of(&s, "wf"),
+        (ToolStatus::Interrupted, Some("killed".into()))
+    );
+    // A successful TaskStop ends the shell it names; a failed one does not.
+    let stop = |id: &str, task: &str, is_error: bool| {
+        let uuid = format!("s-{id}");
+        let call = tool_use(id, "TaskStop", json!({"task_id": task}));
+        let tur = json!({"message": "Successfully stopped task", "task_id": task});
+        [
+            reply(
+                &format!("a-{id}"),
+                None,
+                &format!("msg-{id}"),
+                json!([call]),
+            ),
+            result(&uuid, id, json!("{}"), is_error, tur, json!({})),
+        ]
+    };
+    let s = with(stop("stop1", "bg1", false).to_vec());
+    assert_eq!(
+        status_of(&s, "sh"),
+        (ToolStatus::Interrupted, Some("stopped".into()))
+    );
+    assert_eq!(call(&s, "sh").ended_at, Some(TS_MS));
+    let s = with(stop("stop2", "bg1", true).to_vec());
+    assert_eq!(call(&s, "sh").status, ToolStatus::Pending);
+    // A record 11 minutes later is past the 10 minute Monitor; 5 minutes later is not. A
+    // persistent Monitor has no end.
+    let later = |ts: &str| {
+        at_time(
+            line(
+                "system",
+                "i1",
+                None,
+                json!({"subtype": "informational", "content": "x"}),
+            ),
+            ts,
+        )
+    };
+    let s = with(vec![later("2026-10-12T09:11:00.000Z")]);
+    assert_eq!(pending(&s), ["ag", "wf", "sh", "mp"]);
+    assert_eq!(
+        status_of(&s, "m10"),
+        (ToolStatus::Ok, Some("expired".into()))
+    );
+    assert_eq!(call(&s, "m10").ended_at, Some(TS_MS + 600_000));
+    assert_eq!(
+        pending(&with(vec![later("2026-10-12T09:05:00.000Z")])).len(),
+        5
+    );
+}
+
+/// Claude writes a typed `/compact` as a prompt and again as the expanded command line.
+#[test]
+fn a_typed_slash_command_is_not_shown_twice() {
+    let expanded = |name: &str, args: &str| {
+        format!(
+            "<command-name>{name}</command-name>\n<command-message>x</command-message>\n<command-args>{args}</command-args>"
+        )
+    };
+    let user = |uuid: &str, parent: Option<&str>, prompt: &str, text: String| {
+        line(
+            "user",
+            uuid,
+            parent,
+            json!({"promptId": prompt, "message": {"role": "user", "content": text}}),
+        )
+    };
+    let s = transcript(&[
+        user("c0", None, "p1", "/compact".into()),
+        line(
+            "system",
+            "b1",
+            None,
+            json!({"subtype": "compact_boundary", "content": "Conversation compacted",
+            "compactMetadata": {"trigger": "manual", "preTokens": 10, "postTokens": 2}}),
+        ),
+        // A new promptId in between (a compaction starts one) still pairs.
+        user("c2", Some("b1"), "p9", expanded("/compact", "")),
+        user(
+            "c3",
+            Some("c2"),
+            "p9",
+            "<local-command-stdout>Compacted</local-command-stdout>".into(),
+        ),
+        // These do not: no typed prompt behind the /model line, and the last expansion comes a
+        // minute after the prompt.
+        user("m1", None, "p2", expanded("/model", "opus")),
+        user("c4", None, "p3", "/compact".into()),
+        at_time(
+            user("c5", Some("c4"), "p4", expanded("/compact", "")),
+            "2026-10-12T09:01:00.000Z",
+        ),
+    ]);
+    let commands: Vec<_> = s
+        .messages()
+        .filter(|m| m.origin == Origin::Command)
+        .map(|m| m.kind.clone().unwrap())
+        .collect();
+    assert_eq!(
+        commands,
+        ["local-command-stdout", "command-name", "command-name"]
+    );
+    assert_eq!(user_texts(&s, Origin::Human), ["/compact", "/compact"]);
+    let stdout = s
+        .entries
+        .iter()
+        .find(|e| e.id.as_deref() == Some("c3"))
+        .unwrap();
+    assert_eq!(
+        stdout.parent_id.as_deref(),
+        Some("c0"),
+        "the dropped line's uuid is the prompt's"
+    );
+}
+
+/// Hook text is read: a block's reason, a message, the errors of a Stop run.
+#[test]
+fn hook_errors_and_messages_are_read() {
+    let hook = |uuid: &str, a: Value| line("attachment", uuid, None, json!({"attachment": a}));
+    let s = transcript(&[
+        hook(
+            "h1",
+            json!({"type": "hook_blocking_error", "hookEvent": "Stop", "hookName": "Stop",
+            "blockingError": {"blockingError": "read the skill first", "command": "check.sh"}}),
+        ),
+        hook(
+            "h2",
+            json!({"type": "hook_system_message", "hookEvent": "PostToolUse", "content": "Tip: push soon"}),
+        ),
+        hook(
+            "h3",
+            json!({"type": "hook_non_blocking_error", "hookEvent": "UserPromptSubmit", "stderr": "bun: not found", "exitCode": 127}),
+        ),
+        line(
+            "system",
+            "h4",
+            None,
+            json!({"subtype": "stop_hook_summary", "hookInfos": [{"command": "check.sh"}],
+            "hookErrors": ["one", "two"], "preventedContinuation": false}),
+        ),
+    ]);
+    let got: Vec<_> = hooks(&s)
+        .iter()
+        .map(|h| {
+            (
+                h.blocked,
+                h.command.as_deref(),
+                h.stdout.as_deref(),
+                h.stderr.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (true, Some("check.sh"), None, Some("read the skill first")),
+            (false, None, Some("Tip: push soon"), None),
+            (false, None, None, Some("bun: not found")),
+            (false, Some("check.sh"), None, Some("one\ntwo")),
+        ]
+    );
+}
+
+/// Attachments the UI shows as one line become a notice with that line; the record stays.
+#[test]
+fn shown_attachments_are_one_line_notices() {
+    let att = |uuid: &str, a: Value| line("attachment", uuid, None, json!({"attachment": a}));
+    let s = transcript(&[
+        att(
+            "f",
+            json!({"type": "file", "filename": "/w/a.rs", "displayPath": "a.rs",
+            "content": {"type": "text", "file": {"filePath": "/w/a.rs", "content": "x\ny", "numLines": 2, "totalLines": 2}}}),
+        ),
+        att(
+            "d",
+            json!({"type": "directory", "path": "/w/src", "displayPath": "src", "content": "a.rs\nb.rs"}),
+        ),
+        att(
+            "m",
+            json!({"type": "nested_memory", "path": "/w/CLAUDE.md", "displayPath": "CLAUDE.md",
+            "content": {"path": "/w/CLAUDE.md", "type": "Project", "content": "rules"}}),
+        ),
+        att(
+            "c",
+            json!({"type": "compact_file_reference", "filename": "/w/b.rs", "displayPath": "b.rs"}),
+        ),
+        att(
+            "s",
+            json!({"type": "invoked_skills", "skills": [{"name": "commit", "content": "body"}, {"name": "review"}]}),
+        ),
+        att(
+            "g",
+            json!({"type": "diagnostics", "files": [{"uri": "/w/a.rs", "diagnostics": [{"message": "a"}, {"message": "b"}]}]}),
+        ),
+        att(
+            "k",
+            json!({"type": "goal_status", "met": true, "condition": "tests pass", "iterations": 2}),
+        ),
+        att(
+            "n",
+            json!({"type": "goal_status", "met": false, "reason": "still red", "condition": "tests pass"}),
+        ),
+        att(
+            "e",
+            json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "tests pass"}),
+        ),
+        att(
+            "t",
+            json!({"type": "task_status", "taskId": "t1", "description": "Refine map", "status": "completed"}),
+        ),
+    ]);
+    let notices: Vec<(String, String)> = s
+        .entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Notice(n) => Some((n.kind.clone().unwrap(), n.text.clone())),
+            _ => None,
+        })
+        .collect();
+    let want = [
+        ("file", "Read a.rs (2 lines)"),
+        ("directory", "Listed directory src/"),
+        ("nested_memory", "Loaded CLAUDE.md"),
+        ("compact_file_reference", "Referenced file b.rs"),
+        ("invoked_skills", "Skills restored: commit, review"),
+        ("diagnostics", "Found 2 new diagnostic issues in 1 file"),
+        ("goal_status", "Goal met: tests pass"),
+        ("goal_status", "Goal not met: still red"),
+        ("task_status", "Refine map completed in background"),
+    ];
+    assert_eq!(notices, want.map(|(k, t)| (k.to_string(), t.to_string())));
+    // The re-armed goal check shows nothing new and stays a plain record.
+    assert!(other_kinds(&s).contains(&"attachment.goal_status"));
+    let file = s
+        .entries
+        .iter()
+        .find(|e| e.id.as_deref() == Some("f"))
+        .unwrap();
+    assert_eq!(
+        file.extra.as_ref().unwrap()["attachment"]["content"]["file"]["content"],
+        "x\ny"
+    );
+}
+
+/// A `task_status` attachment ends the task it names.
+#[test]
+fn a_task_status_attachment_ends_its_agent() {
+    let mut lines = launched(&[async_agent("ag", "agid")]);
+    lines.push(line(
+        "attachment",
+        "ts1",
+        None,
+        json!({"attachment": {"type": "task_status", "taskId": "agid",
+        "description": "scan", "status": "running"}}),
+    ));
+    assert_eq!(call(&transcript(&lines), "ag").status, ToolStatus::Pending);
+    lines.push(line(
+        "attachment",
+        "ts2",
+        None,
+        json!({"attachment": {"type": "task_status", "taskId": "agid",
+        "description": "scan", "status": "completed"}}),
+    ));
+    assert_eq!(
+        status_of(&transcript(&lines), "ag"),
+        (ToolStatus::Ok, Some("completed".into()))
+    );
+}
+
+/// Old deliveries have no `origin`: `commandMode` is their kind.
+#[test]
+fn queued_input_takes_its_kind_from_the_command_mode() {
+    let queued = |uuid: &str, mode: &str, prompt: &str| {
+        line(
+            "attachment",
+            uuid,
+            None,
+            json!({"attachment": {"type": "queued_command", "commandMode": mode, "prompt": prompt}}),
+        )
+    };
+    let s = transcript(&[
+        queued(
+            "q1",
+            "task-notification",
+            "<task-notification>\n<task-id>x</task-id>\n</task-notification>",
+        ),
+        queued("q2", "prompt", "keep going"),
+    ]);
+    let notice = message(at(&s, 1));
+    assert_eq!(
+        (notice.origin, notice.kind.as_deref()),
+        (Origin::Notification, Some("task-notification"))
+    );
+    let human = message(at(&s, 2));
+    assert_eq!((human.origin, human.kind.as_deref()), (Origin::Human, None));
+}
+
+/// Task tools name one task each.
+#[test]
+fn task_create_and_update_are_typed() {
+    let s = transcript(&[reply(
+        "a1",
+        None,
+        "msg_1",
+        json!([
+            tool_use(
+                "c",
+                "TaskCreate",
+                json!({"subject": "Write it", "description": "d"})
+            ),
+            tool_use(
+                "u",
+                "TaskUpdate",
+                json!({"taskId": "3", "status": "completed"})
+            ),
+            tool_use(
+                "v",
+                "TaskUpdate",
+                json!({"taskId": "3", "subject": "Renamed"})
+            ),
+        ]),
+    )]);
+    let item = |id: &str| match &call(&s, id).tool {
+        Tool::Todo { items } => (items[0].content.clone(), items[0].status.clone()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(item("c"), ("Write it".into(), Some("pending".into())));
+    assert_eq!(item("u"), ("#3".into(), Some("completed".into())));
+    assert_eq!(item("v"), ("Renamed".into(), None));
+}
+
+// Abandoned branches.
+
+fn human(uuid: &str, parent: Option<&str>, text: &str) -> Value {
+    prompt(uuid, parent, json!(text))
+}
+
+fn note(uuid: &str, parent: &str) -> Value {
+    let a = json!({"attachment": {"type": "date_change", "newDate": "d"}});
+    line("attachment", uuid, Some(parent), a)
+}
+
+/// A prompt sent again after Esc or a rewind: its first try and what hangs off it are not part
+/// of the conversation that went on.
+#[test]
+fn a_prompt_sent_again_drops_its_first_try() {
+    let s = transcript(&[
+        human("u0", None, "start"),
+        reply(
+            "a0",
+            Some("u0"),
+            "msg_0",
+            json!([{"type": "text", "text": "ok"}]),
+        ),
+        // The first try, with an attachment and a reply of its own.
+        human("p1", Some("a0"), "do it"),
+        note("n1", "p1"),
+        reply(
+            "a1",
+            Some("n1"),
+            "msg_1",
+            json!([{"type": "text", "text": "first answer"}]),
+        ),
+        // The prompt again from the same point, and the conversation goes on from here.
+        human("p2", Some("a0"), "do it"),
+        reply(
+            "a2",
+            Some("p2"),
+            "msg_2",
+            json!([{"type": "text", "text": "second answer"}]),
+        ),
+        human("u3", Some("a2"), "thanks"),
+    ]);
+    assert_eq!(user_texts(&s, Origin::Human), ["start", "do it", "thanks"]);
+    let said: Vec<_> = assistants(&s).iter().map(|(_, m)| m.text()).collect();
+    assert_eq!(said, ["ok", "second answer"]);
+    assert!(!s.entries.iter().any(|e| e.id.as_deref() == Some("n1")));
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.message.starts_with("3 entries on branches"))
+    );
+}
+
+/// Only a prompt head is a branch: results that share a parent, a queued input beside the
+/// reply that went on, and a side record beside the next prompt stay.
+#[test]
+fn only_a_prompt_head_is_pruned() {
+    let queued = line(
+        "attachment",
+        "q1",
+        Some("a2"),
+        json!({"attachment": {"type": "queued_command", "prompt": "also this"}}),
+    );
+    let s = transcript(&[
+        human("u0", None, "go"),
+        reply(
+            "a1",
+            Some("u0"),
+            "msg_1",
+            json!([tool_use("A", "Bash", json!({"command": "a"}))]),
+        ),
+        reply(
+            "a2",
+            Some("a1"),
+            "msg_1",
+            json!([tool_use("B", "Bash", json!({"command": "b"}))]),
+        ),
+        queued,
+        result("rA", "A", json!("ra"), false, shell_ok("ra"), json!({})),
+        result("rB", "B", json!("rb"), false, shell_ok("rb"), json!({})),
+        reply(
+            "a3",
+            Some("a2"),
+            "msg_3",
+            json!([{"type": "text", "text": "both done"}]),
+        ),
+        // A side record beside the prompt that went on is no branch either.
+        note("x1", "a3"),
+        human("u4", Some("a3"), "next"),
+    ]);
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    assert!(s.entries.iter().any(|e| e.id.as_deref() == Some("x1")));
+    assert_eq!(call(&s, "A").status, ToolStatus::Ok);
+    assert_eq!(call(&s, "B").status, ToolStatus::Ok);
+    assert!(s.messages().any(|m| m.text() == "also this"));
+}
+
+/// A rewind before a compaction still prunes: the live chain goes through the boundary.
+#[test]
+fn the_live_chain_crosses_a_compaction() {
+    let boundary = line(
+        "system",
+        "b1",
+        None,
+        json!({"subtype": "compact_boundary", "content": "Conversation compacted",
+        "logicalParentUuid": "a2", "compactMetadata": {"trigger": "manual", "preTokens": 10, "postTokens": 2}}),
+    );
+    let s = transcript(&[
+        human("u0", None, "start"),
+        human("p1", Some("u0"), "first try"),
+        human("p2", Some("u0"), "second try"),
+        reply(
+            "a2",
+            Some("p2"),
+            "msg_2",
+            json!([{"type": "text", "text": "answer"}]),
+        ),
+        boundary,
+        human("u9", Some("b1"), "after"),
+    ]);
+    assert_eq!(
+        user_texts(&s, Origin::Human),
+        ["start", "second try", "after"]
+    );
+}
+
+/// A persistent Monitor ignores its `timeout_ms` (real inputs carry both, `persistent` as a
+/// boolean or as a string).
+#[test]
+fn a_persistent_monitor_does_not_expire() {
+    let calls = [
+        monitor(
+            "mb",
+            json!({"timeout_ms": 600000, "persistent": true}),
+            "mbid",
+        ),
+        monitor(
+            "ms",
+            json!({"timeout_ms": 600000, "persistent": "true"}),
+            "msid",
+        ),
+        monitor(
+            "mf",
+            json!({"timeout_ms": 600000, "persistent": "false"}),
+            "mfid",
+        ),
+    ];
+    let mut lines = launched(&calls);
+    let info = json!({"subtype": "informational", "content": "x"});
+    lines.push(at_time(
+        line("system", "i1", None, info),
+        "2026-10-12T09:11:00.000Z",
+    ));
+    let s = transcript(&lines);
+    let got: Vec<_> = ["mb", "ms", "mf"]
+        .iter()
+        .map(|id| call(&s, id).status)
+        .collect();
+    assert_eq!(
+        got,
+        [ToolStatus::Pending, ToolStatus::Pending, ToolStatus::Ok]
+    );
+}
+
+/// The tokens of an abandoned branch were spent: they stay in the session total.
+#[test]
+fn a_dropped_branch_keeps_its_usage_in_the_total() {
+    let spent = |mut r: Value, input: u64, output: u64| {
+        r["message"]["usage"] = json!({"input_tokens": input, "output_tokens": output});
+        r
+    };
+    let text = json!([{"type": "text", "text": "ok"}]);
+    let s = transcript(&[
+        human("u0", None, "start"),
+        human("p1", Some("u0"), "do it"),
+        spent(reply("a1", Some("p1"), "msg_1", text.clone()), 100, 5000),
+        human("p2", Some("u0"), "do it"),
+        spent(reply("a2", Some("p2"), "msg_2", text), 10, 20),
+    ]);
+    assert_eq!(assistants(&s).len(), 1);
+    assert_eq!((s.usage.input, s.usage.output), (110, 5020));
+}
+
+/// A compaction written inside a dead branch goes with it, so no parent or logical parent
+/// points at a dropped entry.
+#[test]
+fn a_compaction_in_a_dead_branch_is_dropped() {
+    let boundary = line(
+        "system",
+        "b1",
+        None,
+        json!({"subtype": "compact_boundary", "content": "Conversation compacted",
+        "logicalParentUuid": "a1", "compactMetadata": {"trigger": "manual", "preTokens": 10, "postTokens": 2}}),
+    );
+    let summary = line(
+        "user",
+        "s1",
+        Some("b1"),
+        json!({"isCompactSummary": true,
+        "message": {"role": "user", "content": "This session is being continued from a previous conversation"}}),
+    );
+    let text = json!([{"type": "text", "text": "ok"}]);
+    let s = transcript(&[
+        human("u0", None, "start"),
+        human("p1", Some("u0"), "first try"),
+        reply("a1", Some("p1"), "msg_1", text.clone()),
+        boundary,
+        summary,
+        human("p2", Some("u0"), "second try"),
+        reply("a2", Some("p2"), "msg_2", text),
+    ]);
+    assert!(
+        !s.entries
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Compaction(_)))
+    );
+    let ids: Vec<_> = s.entries.iter().filter_map(|e| e.id.as_deref()).collect();
+    for e in &s.entries {
+        if let Some(p) = &e.parent_id {
+            assert!(ids.contains(&p.as_str()), "dangling parent {p}");
+        }
+    }
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.message.starts_with("3 entries on branches"))
     );
 }

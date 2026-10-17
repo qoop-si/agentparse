@@ -164,7 +164,7 @@ A corrupt JSON line, a bad database row, and a tool result without its call each
 | `author` | `Option<String>` | The sender when it is another agent (a Codex agent path, a Claude teammate) |
 | `model` | `Option<String>` | The model that wrote it |
 | `agent` | `Option<String>` | Agent or mode, only where the product records it per message (OpenCode) |
-| `phase` | `Option<String>` | Codex `commentary` or `final_answer`. `queued` for Claude input that was still waiting in the queue |
+| `phase` | `Option<String>` | Codex `commentary` or `final_answer`. `queued` for input that was still waiting in the queue (Claude `queue-operation`, OpenCode `session_pending`) |
 | `parts` | `Vec<Part>` | Ordered content |
 | `usage` | `Option<Usage>` | Tokens for the model call behind this message |
 | `stop_reason` | `Option<String>` | Why generation stopped, as recorded |

@@ -56,6 +56,29 @@ pub(super) fn v2_entries(rows: Vec<V2Row>) -> Vec<Entry> {
     out
 }
 
+/// `session_pending` rows: a prompt typed while the session was busy is a queued human message,
+/// other kinds (a pending compaction, a move) stay as recorded.
+pub(super) fn v2_pending(rows: Vec<V2Row>) -> Vec<Entry> {
+    let queued = |row: V2Row| match row.ty.as_str() {
+        "user" => {
+            let mut e = v2_user(row);
+            e.turn_id = None;
+            if let EntryKind::Message(m) = &mut e.kind {
+                m.phase = Some("queued".into());
+            }
+            e
+        }
+        _ => {
+            let kind = EntryKind::Other(Other {
+                kind: format!("session_pending.{}", row.ty),
+                data: Value::Object(row.data),
+            });
+            entry(Some(row.id), row.created, None, Map::new(), kind)
+        }
+    };
+    rows.into_iter().map(queued).collect()
+}
+
 fn v2_user(row: V2Row) -> Entry {
     let V2Row {
         id,
@@ -247,6 +270,7 @@ fn apply_completions(entries: &mut [Entry], completions: &[Completion]) {
         } else {
             ToolStatus::Ok
         };
+        call.ended_at = done.ts.or(call.ended_at);
         if !done.state.is_empty() {
             call.status_detail = Some(done.state.clone());
         }
@@ -459,6 +483,7 @@ fn v2_idle(row: V2Row) -> Entry {
             status,
             duration_ms: None,
             error: message,
+            ..Default::default()
         }),
     )
 }

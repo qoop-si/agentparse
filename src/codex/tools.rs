@@ -12,10 +12,14 @@ use crate::util::{
     u64_field,
 };
 use crate::{
-    EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Shell, ShellResult, TodoItem,
-    Tool, ToolCall, ToolOutput, ToolResult, ToolStatus,
+    EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Shell, ShellResult, Source,
+    TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus,
 };
 use serde_json::{Value, json};
+use std::io::{Read, Seek, SeekFrom};
+
+/// How much of a child rollout's end is read to find how its last turn ended.
+const CHILD_TAIL: u64 = 256 * 1024;
 
 impl Parser {
     // ---- tool calls ----
@@ -141,6 +145,7 @@ impl Parser {
         let Some(r) = self.procs.get(process).copied() else {
             return;
         };
+        let ts = self.rec.ts;
         let Some(call) = self.call_mut(r) else { return };
         if !matches!(call.tool, Tool::Shell(_)) {
             return;
@@ -152,6 +157,11 @@ impl Parser {
             shell.exit_code = Some(code);
             if code != 0 {
                 call.status = ToolStatus::Error;
+            } else if call.status == ToolStatus::Pending {
+                call.status = ToolStatus::Ok;
+            }
+            if call.ended_at.is_none() {
+                call.ended_at = ts;
             }
         }
     }
@@ -204,13 +214,64 @@ impl Parser {
         match owner.or_else(|| self.cell_running(&child)) {
             Some(cell) => self.push_child(cell, child),
             None => {
+                let mut output = child.output.unwrap_or_default();
+                // No cell carried the item to the model: what the command printed is its text.
+                if let (true, Some(shell)) = (output.text.is_empty(), &output.shell) {
+                    output.text = shell.stdout.clone().unwrap_or_default();
+                }
                 let result = ToolResult {
                     call_id: child.id,
                     status: child.status,
                     status_detail: child.status_detail,
-                    output: child.output.unwrap_or_default(),
+                    output,
                 };
                 self.orphan(result, Obj::new())
+            }
+        }
+    }
+
+    /// The `spawn_agent` call of the child a `completed` activity reports on: its record has an
+    /// id of its own (`subagent-completed-<thread>`), so the call is found by its child thread.
+    pub(super) fn spawn_of(&mut self, ty: &str, item: &Obj) -> Option<Ref> {
+        let thread = obj_str(item, "agent_thread_id").filter(|_| {
+            ty == "SubAgentActivity" && obj_str(item, "kind").as_deref() == Some("completed")
+        })?;
+        let refs: Vec<Ref> = self.calls.values().copied().collect();
+        refs.into_iter().find(|&r| {
+            let call = self.call_mut(r);
+            call.is_some_and(|c| {
+                c.name == "spawn_agent" && c.child_session.as_deref() == Some(&thread)
+            })
+        })
+    }
+
+    /// A spawned agent runs until its `completed` record: a spawn call whose child started and
+    /// never completed is still running, unless the child's own rollout (next to this file) shows
+    /// its last turn ended: `Interrupted` after a `turn_aborted`, `Ok` after a `task_complete`.
+    pub(super) fn running_children(&mut self) {
+        let refs: Vec<Ref> = self.calls.values().copied().collect();
+        let source = self.s.source.clone();
+        for r in refs {
+            let Some(call) = self.call_mut(r) else {
+                continue;
+            };
+            let spawned = call.name == "spawn_agent" && call.child_session.is_some();
+            if !(spawned && call.status == ToolStatus::Ok && call.status_detail.is_none()) {
+                continue;
+            }
+            let ended = call
+                .child_session
+                .as_deref()
+                .and_then(|t| child_end(&source, t));
+            match ended {
+                Some(status) => {
+                    call.status = status;
+                    call.status_detail = Some("ended".into());
+                }
+                None => {
+                    call.status = ToolStatus::Pending;
+                    call.ended_at = None;
+                }
             }
         }
     }
@@ -219,7 +280,12 @@ impl Parser {
     /// `exec_command` call gets its result.
     fn late_process(&mut self, r: Ref, process: String, item: Obj, times: Times) {
         if !matches!(self.call_mut(r).map(|c| &c.tool), Some(Tool::Code { .. })) {
-            return self.enrich(r, "CommandExecution", item);
+            self.enrich(r, "CommandExecution", item);
+            // The call returned when the process went to the background; it ends with the item.
+            if let Some(call) = self.call_mut(r) {
+                call.ended_at = times.ended.or(call.ended_at);
+            }
+            return;
         }
         let mut child = child_call("CommandExecution", item, times, self.cwd());
         if let Some(shell) = child.output.as_mut().and_then(|o| o.shell.as_mut()) {
@@ -308,6 +374,15 @@ impl Parser {
         match kind {
             "exec_command_end" | "CommandExecution" => shell_end(call, &mut ev),
             "patch_apply_end" | "FileChange" => patch_end(call, &mut ev),
+            // The child finished: the call that spawned it ends with it.
+            "SubAgentActivity" if obj_str(&ev, "kind").as_deref() == Some("completed") => {
+                call.status = ToolStatus::Ok;
+                call.status_detail = Some("completed".into());
+                call.ended_at = ev
+                    .get("completed_at_ms")
+                    .and_then(Value::as_i64)
+                    .or(call.ended_at);
+            }
             "SubAgentActivity" => call.child_session = obj_str(&ev, "agent_thread_id"),
             "CollabAgentToolCall" => {
                 call.status = item_status(&ev);
@@ -334,6 +409,39 @@ impl Parser {
             ev.insert("type".into(), Value::String(kind.into()));
         }
         push_data(output_mut(call), stripped(Value::Object(ev)));
+    }
+}
+
+/// How a child thread's rollout ends, read from the tail of its file in the parent's directory:
+/// `Interrupted` when the last turn record is `turn_aborted`, `Ok` for `task_complete`, `None` when
+/// it is still in a turn or the file is not there.
+fn child_end(source: &Source, thread: &str) -> Option<ToolStatus> {
+    let Source::File { path } = source else {
+        return None;
+    };
+    let name = |p: &std::path::Path| p.file_name()?.to_str().map(str::to_owned);
+    let file = std::fs::read_dir(path.parent()?)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            let n = name(&e.path()).unwrap_or_default();
+            n.ends_with(".jsonl") && super::thread_id(&n) == Some(thread)
+        })?;
+    let mut f = std::fs::File::open(file.path()).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(CHILD_TAIL)))
+        .ok()?;
+    let mut tail = String::new();
+    f.take(CHILD_TAIL).read_to_string(&mut tail).ok()?;
+    let last = tail.lines().rev().find_map(|l| {
+        ["turn_aborted", "task_complete", "task_started"]
+            .into_iter()
+            .find(|t| l.contains(&format!("\"type\":\"{t}\"")))
+    });
+    match last? {
+        "turn_aborted" => Some(ToolStatus::Interrupted),
+        "task_complete" => Some(ToolStatus::Ok),
+        _ => None,
     }
 }
 
@@ -401,7 +509,7 @@ pub(super) fn tool_for(name: &str, input: &Value, cwd: Option<String>) -> Tool {
             limit: None,
         }),
         "request_user_input" => Some(Tool::Question),
-        "web_search_call" | "web_search" => Some(web_action(Some(input), None)),
+        "web_search_call" | "web_search" => Some(web_action(Some(input), None, None)),
         n if COLLAB_TOOLS.contains(&n) || n == "wait" => Some(Tool::Task {
             description: str_field(input, &["task_name", "target", "path_prefix"]),
             prompt: str_field(input, &["message", "prompt"]),
@@ -484,16 +592,19 @@ fn todo(input: &Value) -> Tool {
 }
 
 /// Web search actions: `search` (query or queries), `open_page` / `openPage` (url),
-/// `find_in_page` / `findInPage` (url, pattern).
-fn web_action(action: Option<&Value>, query: Option<String>) -> Tool {
+/// `find_in_page` / `findInPage` (url, pattern in `prompt`). An action that names no page (a
+/// `findInPage` with a null url, `other`) reads the page from the first of the item's `results`.
+fn web_action(action: Option<&Value>, query: Option<String>, results: Option<&Value>) -> Tool {
     let ty = action
         .and_then(|a| str_field(a, &["type"]))
         .unwrap_or_default();
     let url = action.and_then(|a| str_field(a, &["url"]));
+    let page = || results?.get(0).and_then(|r| str_field(r, &["url"]));
     match ty.as_str() {
-        "open_page" | "openPage" | "find_in_page" | "findInPage" => {
-            Tool::WebFetch { url, prompt: None }
-        }
+        "open_page" | "openPage" | "find_in_page" | "findInPage" => Tool::WebFetch {
+            url: url.or_else(page),
+            prompt: action.and_then(|a| str_field(a, &["pattern"])),
+        },
         _ => {
             let first = action
                 .and_then(|a| a.get("queries"))
@@ -502,8 +613,15 @@ fn web_action(action: Option<&Value>, query: Option<String>) -> Tool {
             let query = action
                 .and_then(|a| str_field(a, &["query"]))
                 .or(first)
-                .or(query);
-            Tool::WebSearch { query }
+                .or(query)
+                .filter(|q| !q.trim().is_empty());
+            match (query, page()) {
+                (None, Some(url)) => Tool::WebFetch {
+                    url: Some(url),
+                    prompt: None,
+                },
+                (query, _) => Tool::WebSearch { query },
+            }
         }
     }
 }
@@ -511,7 +629,11 @@ fn web_action(action: Option<&Value>, query: Option<String>) -> Tool {
 pub(super) fn web_item(item: &Obj) -> Tool {
     match obj_str(item, "kind") {
         Some(kind) if kind != "web.search" => Tool::Other,
-        _ => web_action(item.get("action"), obj_str(item, "query")),
+        _ => web_action(
+            item.get("action"),
+            obj_str(item, "query"),
+            item.get("results"),
+        ),
     }
 }
 

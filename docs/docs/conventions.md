@@ -55,7 +55,7 @@ Rules that apply to every product:
 
 - A shell command with a non-zero `exit_code`, or with `timed_out` set, is `Error`, whatever the product called it.
 - A call with no result at all becomes `Interrupted` when a later assistant message or turn end exists in the parsed window. Without one, it stays `Pending`.
-- A call whose result says it is still running (a background id, a yielded process, a running Codex cell) is never inferred `Interrupted`. It stays `Ok` (background) or `Pending` (running cell) until its own completion record arrives.
+- A call whose result says it is still running (a background id, a yielded process, a running Codex cell) is never inferred `Interrupted`. It stays `Pending` until its own completion record arrives (a notification, a stop, a poll, the command item). A launch that is never reported on stays `Pending`.
 - `ToolCall::failed()` is true for `Error`, `Rejected` and `Interrupted`.
 
 ## Roles, origin and kind

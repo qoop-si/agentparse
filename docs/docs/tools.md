@@ -72,7 +72,7 @@ Which recorded tool name becomes which `Tool`. "none" means the product has no s
 | `Question` | `AskUserQuestion` | `request_user_input` | `question` | `ask_user` |
 | `Plan` | `EnterPlanMode`, `ExitPlanMode` | none (a Codex plan item is assistant text) | `plan_enter`, `plan_exit` | `enter_plan_mode`, `exit_plan_mode` |
 | `Skill` | `Skill`, `SlashCommand` | none | `skill` | `activate_skill` |
-| `Other` | `NotebookEdit`, `ToolSearch`, and everything else. `TaskCreate` and `TaskUpdate` too, because they send list changes, not a list | everything else | `invalid`, plugin tools, MCP tools | `read_many_files`, `save_memory`, tracker tools, and everything else |
+| `Other` | `NotebookEdit`, `ToolSearch`, and everything else. | everything else | `invalid`, plugin tools, MCP tools | `read_many_files`, `save_memory`, tracker tools, and everything else |
 
 Gemini CLI MCP names have a known limit: server names may contain `_`, so the split at the first `_` is a best guess. The raw name is always in `ToolCall.name`.
 

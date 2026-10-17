@@ -114,6 +114,21 @@ fn typed(name: &str, i: &Value, cwd: Option<&str>) -> Option<Tool> {
         "WebSearch" => Tool::WebSearch {
             query: s(&["query"]),
         },
+        // A task list entry by entry: the call names one task, not the whole list.
+        "TaskCreate" => Tool::Todo {
+            items: vec![TodoItem {
+                content: s(&["subject"])?,
+                status: Some("pending".into()),
+                priority: None,
+            }],
+        },
+        "TaskUpdate" => Tool::Todo {
+            items: vec![TodoItem {
+                content: s(&["subject"]).or_else(|| s(&["taskId"]).map(|id| format!("#{id}")))?,
+                status: s(&["status"]),
+                priority: None,
+            }],
+        },
         "TodoWrite" => Tool::Todo {
             items: i
                 .get("todos")?
@@ -126,6 +141,12 @@ fn typed(name: &str, i: &Value, cwd: Option<&str>) -> Option<Tool> {
             description: s(&["description"]),
             prompt: s(&["prompt"]),
             agent_type: s(&["subagent_type"]),
+        },
+        // The script is long; the row's text is the launch result's `summary` (`launched`).
+        "Workflow" => Tool::Task {
+            description: None,
+            prompt: None,
+            agent_type: Some("workflow".into()),
         },
         "SendMessage" => Tool::Task {
             description: s(&["summary"]),
@@ -193,8 +214,13 @@ pub(super) fn outcome(
         }
     });
     let mut child = None;
+    let mut async_launch = false;
     match tur {
-        Some(Value::Object(map)) => child = structured(name, input, map, &mut out),
+        Some(Value::Object(map)) => {
+            async_launch = matches!(name, "Agent" | "Task" | "Workflow")
+                && map.get("status").and_then(Value::as_str) == Some("async_launched");
+            child = structured(name, input, map, &mut out);
+        }
         // A string result is the error text again, with an `Error: ` prefix.
         Some(Value::String(s)) => {
             if s != out.text && s.strip_prefix("Error: ") != Some(out.text.as_str()) {
@@ -210,6 +236,15 @@ pub(super) fn outcome(
         status
     };
     persisted(&mut out);
+    // A launch is not an outcome: the task reports back through `apply_notification`.
+    let background = out
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.background_id.is_some());
+    let status = match status {
+        ToolStatus::Ok if async_launch || background => ToolStatus::Pending,
+        status => status,
+    };
     Outcome {
         output: out,
         status,
@@ -513,17 +548,54 @@ fn persisted(out: &mut ToolOutput) {
     }
 }
 
-/// `<task-notification>` fields: the background task finished, failed or was killed.
+/// The id a later notification, stop or status line names this call by.
+pub(super) fn task_id(call: &ToolCall) -> Option<&str> {
+    let out = call.output.as_ref()?;
+    let shell = out.shell.as_ref().and_then(|s| s.background_id.as_deref());
+    let data = || out.data.as_ref()?.get("taskId")?.as_str();
+    shell.or(call.child_session.as_deref()).or_else(data)
+}
+
+/// A launched workflow's one line text is the `summary` of its launch result.
+pub(super) fn launch_summary(call: &mut ToolCall) {
+    let summary = call
+        .output
+        .as_ref()
+        .and_then(|o| o.data.as_ref()?.get("summary")?.as_str());
+    if let (Tool::Task { description, .. }, Some(summary)) = (&mut call.tool, summary) {
+        description.get_or_insert_with(|| summary.to_string());
+    }
+}
+
+/// `<task-notification>` fields, or a bare `<status>` word from another record that ends the task:
+/// completed, failed or killed, plus `done`, `stopped`, `ended` (no report arrived) and `expired`
+/// (a Monitor ran out its timeout). `running` and an interim report change nothing.
 pub(super) fn apply_notification(call: &mut ToolCall, note: &str, ts: Option<i64>) {
     let task = tag_body(note, "task-id").map(String::from);
     match &call.tool {
-        Tool::Task { .. } if call.child_session.is_none() => call.child_session = task.clone(),
+        Tool::Task { .. } if call.child_session.is_none() && call.name != "Workflow" => {
+            call.child_session = task.clone()
+        }
         _ => {}
     }
-    let status = tag_body(note, "status").unwrap_or_default();
-    if !matches!(status, "completed" | "failed" | "killed") {
+    let status = match tag_body(note, "status") {
+        Some(status) => status,
+        // A Monitor that delivered no event says so in an event line without a status.
+        None if tag_body(note, "event").is_some_and(|e| e.starts_with("[Monitor expired")) => {
+            "expired"
+        }
+        None => return,
+    };
+    let interim = tag_body(note, "note").is_some_and(|n| n.contains("background work of its own"));
+    if interim
+        || !matches!(
+            status,
+            "completed" | "done" | "failed" | "killed" | "stopped" | "ended" | "expired"
+        )
+    {
         return;
     }
+    let ended = matches!(status, "killed" | "stopped" | "ended");
     let (code, soft) = summary_exit(tag_body(note, "summary").unwrap_or_default());
     let out = call.output.get_or_insert_default();
     if matches!(call.tool, Tool::Shell(_)) {
@@ -532,14 +604,14 @@ pub(super) fn apply_notification(call: &mut ToolCall, note: &str, ts: Option<i64
         }
         let shell = out.shell.get_or_insert_default();
         shell.exit_code = code.or(shell.exit_code);
-        shell.interrupted |= status == "killed";
+        shell.interrupted |= ended;
         if shell.background_id.is_none() {
             shell.background_id = task;
         }
     }
     call.status = match status {
         "failed" => ToolStatus::Error,
-        "killed" => ToolStatus::Interrupted,
+        _ if ended => ToolStatus::Interrupted,
         // `(exit code 1: No matches found)` is a soft failure, like `returnCodeInterpretation`.
         _ if code.is_some_and(|c| c != 0) && !soft => ToolStatus::Error,
         _ => ToolStatus::Ok,

@@ -69,7 +69,7 @@ A command started in the background has a `background_id`. Its first result only
 | OpenCode | A background completion record is matched to the call by `shellID` |
 | Gemini CLI | The call records `is_background` and the process id in its text |
 
-A call whose result says the job is still running is never marked `Interrupted` just because the log ends. It stays `Ok` (background) or `Pending` (a running Codex cell) until its own completion record arrives.
+A call whose result says the job is still running is never marked `Interrupted` just because the log ends. It stays `Pending` until its own completion record arrives.
 
 ## Real examples
 

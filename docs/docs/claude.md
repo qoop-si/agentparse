@@ -39,10 +39,14 @@ Claude Code writes one line per content block, and several lines can share one A
 | Hook attachments (`hook_success`, `hook_error`, ...) and `stop_hook_summary` | `Hook` |
 | API error messages (`isApiErrorMessage`) | `Error` |
 | Other placeholder messages from the model `<synthetic>` (such as "No response requested.") | `Notice` with `kind: "synthetic"` |
-| `attachment` lines with model-visible text | `Message` with origin `Context`. Without such text: `Other` with kind `attachment.<subtype>` |
+| `attachment` lines the UI shows as one line (`file`, `directory`, `nested_memory`, `compact_file_reference`, `invoked_skills`, `diagnostics`, `goal_status`, `task_status`) | `Notice` with the attachment type as `kind` and that line as `text` (`Read a.rs (12 lines)`). The record stays in `extra` |
+| other `attachment` lines with model-visible text | `Message` with origin `Context`. Without such text: `Other` with kind `attachment.<subtype>` |
 | `queue-operation` lines | Replayed in order (enqueue, dequeue, remove, popAll). Input still queued at the end becomes a human message with `phase: "queued"`. Texts that start with `<` are notifications. The raw lines also stay as `Other` |
 | `file-history-snapshot`, `last-prompt`, `pr-link`, `worktree-state`, and other metadata lines | `Other` |
-| `TaskCreate`, `TaskUpdate` | `Tool::Other`. They send list changes, not a list, so they are not `Todo` |
+| `TaskCreate`, `TaskUpdate` | `Tool::Todo` with one item (the subject or `#<taskId>`, and its status): the call names one task, not the list |
+| `Workflow` | `Tool::Task` with `agent_type: "workflow"`; the description is the `summary` of the launch result |
+| A typed `/compact` (or any slash command) written as a prompt and again as `<command-name>` | One human message: the expanded line is dropped when the human message just before it holds the same text |
+| A prompt sent again after Esc or a rewind | The first try and everything below it are dropped, with a warning, when the sibling prompt is on the chain that goes on (only prompt heads are dropped) |
 
 Settings entries appear when the working directory, permission mode, effort or agent setting changes.
 
@@ -77,7 +81,7 @@ Each subagent file is its own `Session`.
 
 ## Background commands
 
-A `Bash` call with `run_in_background` returns a `backgroundTaskId`, which becomes `ShellResult.background_id`. A later task notification message (origin `Notification`) names the call by its tool use id. agentparse uses it to add the final status and the exit code from the notification summary, when it has one. `BashOutput` and `TaskOutput` calls become `Tool::Process` reads of the same id.
+A background launch (`Bash` with `run_in_background`, an async `Agent`, `Monitor`, `Workflow`) is not an outcome: the call is `Pending`, without `ended_at`, and its `backgroundTaskId` (or `agentId`, `taskId`) is indexed. A later task notification message (origin `Notification`) names the call by its tool use id, or by `<task-id>` when it has none, and ends it: `completed` and `done` are `Ok`, `failed` is `Error`, `killed` and `stopped` are `Interrupted`, with the exit code from the summary when it has one. `running` and an agent that reports while its own background work still runs change nothing. Other records end a launch too: a successful `TaskStop`, `system` `agents_killed`, a `turn_duration` whose `pendingBackgroundAgentCount` (or `pendingWorkflowCount`) is 0, a `task_status` attachment, and a Monitor past its `timeout_ms` (judged against the newest record of the file). `BashOutput` and `TaskOutput` calls become `Tool::Process` reads of the same id.
 
 ## Real example
 

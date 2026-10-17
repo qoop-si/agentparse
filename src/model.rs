@@ -193,7 +193,8 @@ pub struct Message {
     /// Agent or mode, only where the product records it per message (OpenCode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    /// Codex `commentary` / `final_answer`; `queued` for Claude input still waiting in the queue.
+    /// Codex `commentary` / `final_answer`; `queued` for input still waiting in the queue (Claude
+    /// `queue-operation`, OpenCode `session_pending`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     pub parts: Vec<Part>,
@@ -611,6 +612,12 @@ pub struct Turn {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Background agents still running when the turn ended (Claude `turn_duration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_agents: Option<u32>,
+    /// Background workflows still running when the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_workflows: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

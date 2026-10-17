@@ -9,13 +9,13 @@
 //! sessions) are the caller's to dedupe, so `Session.usage` of a resumed file includes them.
 
 use crate::util::{
-    Obj, as_extra, base64_len, join_texts, json_lines, stripped, take_array, take_bool, take_obj,
-    take_str, take_u64, take_with, ts_ms,
+    Obj, as_extra, base64_len, bool_field, join_texts, json_lines, stripped, take_array, take_bool,
+    take_obj, take_str, take_u64, take_with, ts_ms,
 };
 use crate::{
     Agent, Compaction, Entry, EntryKind, Error, ErrorInfo, Git, Hook, Media, Message, Notice,
-    Origin, Other, ParentLink, Part, Result, Role, Session, Settings, Shell, ShellResult, Source,
-    Tool, ToolCall, ToolOutput, ToolResult, ToolStatus, Turn, Usage, Warning,
+    Origin, Other, ParentLink, Part, ProcessAction, Result, Role, Session, Settings, Shell,
+    ShellResult, Source, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus, Turn, Usage, Warning,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,7 +24,7 @@ use std::path::Path;
 
 mod tools;
 
-use tools::{apply_notification, outcome, strip_line_numbers, tool_call};
+use tools::{apply_notification, launch_summary, outcome, strip_line_numbers, task_id, tool_call};
 
 /// Keys every conversation line repeats. Their first value belongs to the session; a line keeps
 /// one in its `extra` only when its value differs.
@@ -56,6 +56,9 @@ const COMMAND_TAGS: &[&str] = &[
     "bash-stdout",
     "bash-stderr",
 ];
+
+/// How far apart a typed slash command and its expanded line can be written.
+const TYPED_GAP_MS: i64 = 10_000;
 
 const INTERRUPTED: &str = "[Request interrupted by user";
 const CONTINUED: &str = "This session is being continued from a previous conversation";
@@ -119,6 +122,8 @@ struct Parser {
     messages: HashMap<String, usize>,
     /// `tool_use` id to (entry index, part index).
     calls: HashMap<String, (usize, usize)>,
+    /// Background task id (shell, agent, monitor, workflow) to the call that launched it.
+    tasks: HashMap<String, (usize, usize)>,
     /// Latest title per line type (`custom-title`, `agent-name`, `ai-title`, `summary`).
     titles: Obj,
     cost: Option<Obj>,
@@ -563,15 +568,41 @@ impl Parser {
             rest,
             ..
         } = held;
+        let mut launched = None;
+        let mut stopped = None;
         if let Some(call) = call_at(&mut self.entries[entry], part) {
             let o = outcome(&call.name, &call.input, block, tur, denial);
             call.status = o.status;
             call.status_detail = o.detail;
             call.output = Some(o.output);
-            call.ended_at = head.ts;
+            // A launched task has not ended: its notification, a stop or a status line ends it.
+            call.ended_at = (o.status != ToolStatus::Pending)
+                .then_some(head.ts)
+                .flatten();
             if o.child.is_some() {
                 call.child_session = o.child;
             }
+            launch_summary(call);
+            if call.status == ToolStatus::Pending {
+                launched = task_id(call).map(String::from);
+            }
+            if let (
+                Tool::Process {
+                    id: Some(id),
+                    action: ProcessAction::Kill,
+                    ..
+                },
+                ToolStatus::Ok,
+            ) = (&call.tool, call.status)
+            {
+                stopped = Some(id.clone());
+            }
+        }
+        if let Some(id) = launched {
+            self.tasks.insert(id, (entry, part));
+        }
+        if let Some(id) = stopped {
+            self.end_task(&id, "stopped", head.ts);
         }
         if let Some(rest) = rest {
             self.absorb_result_line(&head, rest, entry, &call_id);
@@ -723,6 +754,13 @@ impl Parser {
                     u.clone()
                 }
             });
+            // `/compact` typed in the prompt is already a bubble: this expansion of it adds nothing.
+            if let Some(typed) = self.typed_command(&class, &parts, head.ts) {
+                if let (Some(uuid), Some(id)) = (&head.uuid, self.entries[typed].id.clone()) {
+                    self.uuids.entry(uuid.clone()).or_insert(id);
+                }
+                continue;
+            }
             let mut extra = rest.take();
             let kind = match class {
                 Class::Interrupt => {
@@ -746,6 +784,31 @@ impl Parser {
         }
     }
 
+    /// The human message just before a `<command-name>` line that holds the same text: Claude
+    /// writes a typed slash command as a prompt and again expanded, the same moment (a compaction
+    /// in between can start a new `promptId`).
+    fn typed_command(&self, class: &Class, parts: &[Part], ts: Option<i64>) -> Option<usize> {
+        let Class::Message(Origin::Command, Some(tag), _) = class else {
+            return None;
+        };
+        let text = join_texts(parts, "\n");
+        let name = tag_body(&text, "command-name").filter(|_| tag == "command-name")?;
+        let args = tag_body(&text, "command-args").unwrap_or_default();
+        let human =
+            |e: &Entry| matches!(&e.kind, EntryKind::Message(m) if m.origin == Origin::Human);
+        let (at, prev) = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, e)| human(e))?;
+        let EntryKind::Message(m) = &prev.kind else {
+            return None;
+        };
+        let close = ts.zip(prev.ts).is_none_or(|(a, b)| a - b <= TYPED_GAP_MS);
+        (close && m.text().trim() == format!("{name} {args}").trim()).then_some(at)
+    }
+
     fn ctx(&self, rec: &mut Obj) -> Ctx {
         let meta = take_bool(rec, "isMeta");
         let (kind, author) = take_origin(rec);
@@ -757,7 +820,8 @@ impl Parser {
         }
     }
 
-    /// A background task notification updates the call it reports on (by `<tool-use-id>`).
+    /// A background task notification updates the call it reports on: by `<tool-use-id>`, or by
+    /// `<task-id>` when the notification carries no call id (Monitor events, agent reports).
     fn enrich(&mut self, at: usize) {
         let Entry {
             kind: EntryKind::Message(m),
@@ -772,9 +836,9 @@ impl Parser {
         }
         let (text, ts) = (m.text(), *ts);
         for note in text.split("<task-notification>").skip(1) {
-            let Some(&(entry, part)) =
-                tag_body(note, "tool-use-id").and_then(|id| self.calls.get(id))
-            else {
+            let by_call = tag_body(note, "tool-use-id").and_then(|id| self.calls.get(id));
+            let by_task = tag_body(note, "task-id").and_then(|id| self.tasks.get(id));
+            let Some(&(entry, part)) = by_call.or(by_task) else {
                 continue;
             };
             if let Some(call) = call_at(&mut self.entries[entry], part) {
@@ -783,22 +847,117 @@ impl Parser {
         }
     }
 
+    /// End the launched task `id` that is still running: `status` is a word of
+    /// [`apply_notification`].
+    fn end_task(&mut self, id: &str, status: &str, ts: Option<i64>) {
+        let Some(&(entry, part)) = self.tasks.get(id) else {
+            return;
+        };
+        if let Some(call) = call_at(&mut self.entries[entry], part) {
+            if call.status == ToolStatus::Pending {
+                apply_notification(call, &format!("<status>{status}</status>"), ts);
+            }
+        }
+    }
+
+    /// End every launched agent (or workflow) still running, when the harness says none is left.
+    fn end_agents(&mut self, workflows: bool, status: &str, ts: Option<i64>) {
+        for &(entry, part) in self.tasks.values() {
+            let Some(call) = call_at(&mut self.entries[entry], part) else {
+                continue;
+            };
+            let agent = matches!(call.tool, Tool::Task { .. });
+            if agent && (call.name == "Workflow") == workflows && call.status == ToolStatus::Pending
+            {
+                apply_notification(call, &format!("<status>{status}</status>"), ts);
+            }
+        }
+    }
+
+    /// A Monitor outlives its `timeout_ms` without a word: once the file holds a record past
+    /// that time the watch is over.
+    fn expire_monitors(&mut self) {
+        let Some(latest) = self.entries.iter().filter_map(|e| e.ts).max() else {
+            return;
+        };
+        for &(entry, part) in self.tasks.values() {
+            let Some(call) = call_at(&mut self.entries[entry], part) else {
+                continue;
+            };
+            let (Tool::Shell(shell), Some(start)) = (&call.tool, call.started_at) else {
+                continue;
+            };
+            // A persistent Monitor ignores its timeout and runs until stopped or the session ends.
+            let end = shell
+                .timeout_ms
+                .filter(|_| !bool_field(&call.input, &["persistent"]))
+                .map(|t| start.saturating_add(t as i64));
+            if let (true, Some(end)) = (
+                call.name == "Monitor" && call.status == ToolStatus::Pending,
+                end,
+            ) {
+                if end <= latest {
+                    apply_notification(call, "<status>expired</status>", Some(end));
+                }
+            }
+        }
+    }
+
     fn attachment(&mut self, head: Head, mut rec: Obj) {
         let mut a = take_obj(&mut rec, "attachment").unwrap_or_default();
         let sub = take_str(&mut a, "type").unwrap_or_default();
+        if sub == "task_status" {
+            let field = |k: &str| a.get(k).and_then(Value::as_str).map(String::from);
+            if let (Some(id), Some(status)) = (field("taskId"), field("status")) {
+                self.end_task(&id, &status, head.ts);
+            }
+        }
         match sub.as_str() {
             "queued_command" => self.queued(head, rec, a),
             "hook_additional_context" => self.context(head, rec, a, sub),
             s if s.starts_with("hook_") || s == "async_hook_response" => {
                 self.hook(head, rec, a, sub)
             }
-            _ => self.context(head, rec, a, sub),
+            _ => match attachment_line(&sub, &a) {
+                Some(text) => self.line(head, rec, a, sub, text),
+                None => self.context(head, rec, a, sub),
+            },
         }
+    }
+
+    /// An attachment the UI shows as one line (`Read a.rs (12 lines)`): a notice with that line,
+    /// the record kept as recorded. The `rendered` copy goes when it only wraps the body.
+    fn line(&mut self, head: Head, mut rec: Obj, a: Obj, sub: String, text: String) {
+        let a = Value::Object(a);
+        let rendered = rendered_text(rec.get("rendered"));
+        let wraps = |body: String| {
+            rendered
+                .as_deref()
+                .is_some_and(|r| r.contains(&body) || strip_line_numbers(r).contains(&body))
+        };
+        if attachment_text(&a).is_some_and(|(_, body)| wraps(body)) {
+            rec.remove("rendered");
+            rec.remove("renderedRole");
+        }
+        rec.insert("attachment".into(), a);
+        let notice = Notice {
+            level: None,
+            kind: Some(sub),
+            text,
+        };
+        let id = head.uuid.clone();
+        self.push(&head, id, Some(rec), EntryKind::Notice(notice));
     }
 
     /// Input typed (or delivered) while the agent was busy and folded into the running turn.
     fn queued(&mut self, head: Head, mut rec: Obj, mut a: Obj) {
         let (kind, author) = take_origin(&mut a);
+        // Old deliveries carry no `origin`; their `commandMode` names the kind (`prompt` is plain input).
+        let mode = a
+            .get("commandMode")
+            .and_then(Value::as_str)
+            .filter(|m| *m != "prompt");
+        let mode = mode.map(String::from);
         let meta = take_bool(&mut a, "isMeta");
         let prompt = a.remove("prompt").unwrap_or(Value::Null);
         let human = !meta
@@ -817,6 +976,11 @@ impl Parser {
         let msg = if human {
             Message::new(Role::User, Origin::Human, parts)
         } else {
+            let kind = kind.or_else(|| {
+                mode.inspect(|_| {
+                    a.remove("commandMode");
+                })
+            });
             let origin = kind.as_deref().map_or(Origin::Notification, origin_of);
             let kind = Some(kind.unwrap_or_else(|| "queued_command".into()));
             Message {
@@ -834,7 +998,7 @@ impl Parser {
     }
 
     fn hook(&mut self, head: Head, mut rec: Obj, mut a: Obj, sub: String) {
-        let hook = Hook {
+        let mut hook = Hook {
             event: take_str(&mut a, "hookEvent"),
             name: take_str(&mut a, "hookName"),
             command: take_str(&mut a, "command"),
@@ -848,6 +1012,17 @@ impl Parser {
             && a.get("content").and_then(Value::as_str) == hook.stdout.as_deref()
         {
             a.remove("content");
+        }
+        // The text the hook returned: the reason of a block, or a message for the user.
+        if let Some(mut blocking) = take_obj(&mut a, "blockingError") {
+            hook.stderr = hook.stderr.or(take_str(&mut blocking, "blockingError"));
+            hook.command = hook.command.or(take_str(&mut blocking, "command"));
+            if !blocking.is_empty() {
+                a.insert("blockingError".into(), Value::Object(blocking));
+            }
+        }
+        if sub == "hook_system_message" {
+            hook.stdout = hook.stdout.or(take_str(&mut a, "content"));
         }
         a.insert("type".into(), Value::String(sub));
         rec.insert("attachment".into(), Value::Object(a));
@@ -899,6 +1074,8 @@ impl Parser {
         let kind = match sub.as_str() {
             "turn_duration" => EntryKind::Turn(Turn {
                 duration_ms: take_u64(&mut rec, "durationMs"),
+                pending_agents: take_u64(&mut rec, "pendingBackgroundAgentCount").map(|n| n as u32),
+                pending_workflows: take_u64(&mut rec, "pendingWorkflowCount").map(|n| n as u32),
                 ..Default::default()
             }),
             "api_error" => EntryKind::Error(api_error(&mut rec)),
@@ -928,10 +1105,23 @@ impl Parser {
                 text: take_str(&mut rec, "content").unwrap_or_default(),
             }),
         };
+        let pending = match &kind {
+            EntryKind::Turn(t) => (t.pending_agents, t.pending_workflows),
+            _ => (None, None),
+        };
         let id = head.uuid.clone();
         let at = self.push(&head, id, Some(rec), kind);
         if sub == "compact_boundary" {
             self.compaction = Some(at);
+        }
+        // A turn that ends with none left means the earlier launches are over, report or not.
+        let killed = sub == "agents_killed";
+        let status = if killed { "killed" } else { "ended" };
+        if killed || pending.0 == Some(0) {
+            self.end_agents(false, status, head.ts);
+        }
+        if killed || pending.1 == Some(0) {
+            self.end_agents(true, status, head.ts);
         }
     }
 
@@ -959,6 +1149,7 @@ impl Parser {
         }
         self.flush_queue();
         self.flush_orphans();
+        self.expire_monitors();
         self.relink();
         for e in &mut self.entries {
             if let Some(Value::Object(map)) = &mut e.extra {
@@ -1004,7 +1195,19 @@ impl Parser {
         session.extra = as_extra(extra);
         session.entries = self.entries;
         session.warnings = self.warnings;
-        Ok(session.finish())
+        // After `finish`: the usage of a dropped branch was spent all the same and stays in the total.
+        let mut session = session.finish();
+        if let Some((n, first)) = prune_abandoned(&mut session.entries) {
+            let message = format!(
+                "{n} entries on branches the conversation left (a prompt sent again), skipped"
+            );
+            session.warnings.push(Warning {
+                line: first,
+                message,
+            });
+            session.warnings.sort_by_key(|w| w.line);
+        }
+        Ok(session)
     }
 
     /// Session id and parent. A subagent file starts with a sidechain line: its `agentId` is the
@@ -1164,6 +1367,66 @@ impl Parser {
             }
         }
     }
+}
+
+/// A prompt sent again after Esc or a rewind leaves its first try as a branch the conversation
+/// never went on from: a human prompt whose sibling prompt is on the live chain, and everything
+/// below it, is dropped. Only prompt heads count, so results that share a parent stay. A
+/// compaction hangs below its `logical_parent` like a child. Returns how many entries went and the
+/// first of their lines.
+fn prune_abandoned(entries: &mut Vec<Entry>) -> Option<(usize, Option<usize>)> {
+    let ids: HashMap<&str, usize> = (entries.iter().enumerate())
+        .filter_map(|(i, e)| Some((e.id.as_deref()?, i)))
+        .collect();
+    // A compaction has no `parent_id`: it links to the line it follows by `logical_parent`.
+    let parent_of = |e: &Entry| match (&e.kind, &e.parent_id) {
+        (EntryKind::Compaction(c), None) => c.logical_parent.clone(),
+        (_, parent) => parent.clone(),
+    };
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if let Some(&p) = parent_of(e).as_deref().and_then(|p| ids.get(p)) {
+            children.entry(p).or_default().push(i);
+        }
+    }
+    // The live chain: from the last line that has a parent back to the root.
+    let mut live = HashSet::new();
+    let mut at = entries.iter().rposition(|e| parent_of(e).is_some());
+    while let Some(i) = at.filter(|i| live.insert(*i)) {
+        at = parent_of(&entries[i])
+            .as_deref()
+            .and_then(|p| ids.get(p))
+            .copied();
+    }
+    let prompt = |i: usize| matches!(&entries[i].kind, EntryKind::Message(m) if m.origin == Origin::Human && m.role == Role::User);
+    let mut dead = HashSet::new();
+    for siblings in children.values() {
+        if !siblings.iter().any(|&s| live.contains(&s) && prompt(s)) {
+            continue;
+        }
+        for &head in siblings
+            .iter()
+            .filter(|&&h| !live.contains(&h) && prompt(h))
+        {
+            let mut stack = vec![head];
+            while let Some(i) = stack.pop() {
+                if dead.insert(i) {
+                    stack.extend(children.get(&i).into_iter().flatten());
+                }
+            }
+        }
+    }
+    if dead.is_empty() {
+        return None;
+    }
+    let first = dead.iter().filter_map(|&i| entries[i].line).min();
+    let n = dead.len();
+    let mut i = 0;
+    entries.retain(|_| {
+        i += 1;
+        !dead.contains(&(i - 1))
+    });
+    Some((n, first))
 }
 
 /// A `tool_result` block with what its line said about it, kept until its call is read.
@@ -1357,6 +1620,11 @@ fn stop_hooks(rec: &mut Obj) -> Hook {
         blocked: take_bool(rec, "preventedContinuation"),
         ..Default::default()
     };
+    let errors: Vec<String> = take_array(rec, "hookErrors")
+        .into_iter()
+        .filter_map(|e| e.as_str().map(String::from))
+        .collect();
+    hook.stderr = (!errors.is_empty()).then(|| errors.join("\n"));
     if let Some(Value::Array(infos)) = rec.get_mut("hookInfos") {
         if let [Value::Object(info)] = infos.as_mut_slice() {
             hook.command = take_str(info, "command");
@@ -1367,6 +1635,71 @@ fn stop_hooks(rec: &mut Obj) -> Hook {
         }
     }
     hook
+}
+
+/// The one line the UI shows for an attachment; `None` for a kind it does not show that way
+/// (and for a goal check that only re-armed the goal).
+fn attachment_line(sub: &str, a: &Obj) -> Option<String> {
+    let s = |k: &str| a.get(k).and_then(Value::as_str);
+    let path = || {
+        s("displayPath")
+            .or_else(|| s("filename"))
+            .or_else(|| s("path"))
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    Some(match sub {
+        "file" => match a.get("content").and_then(|c| c.pointer("/file/numLines")) {
+            Some(n) => format!("Read {} ({n} lines)", path()?),
+            None => format!("Read {}", path()?),
+        },
+        "directory" => format!("Listed directory {}/", path()?.trim_end_matches('/')),
+        "nested_memory" => format!("Loaded {}", path()?),
+        "compact_file_reference" => format!("Referenced file {}", path()?),
+        "invoked_skills" => {
+            let skills = a.get("skills")?.as_array()?;
+            let names: Vec<&str> = skills
+                .iter()
+                .filter_map(|k| k.get("name")?.as_str())
+                .collect();
+            format!("Skills restored: {}", names.join(", "))
+        }
+        "diagnostics" => {
+            let files = a.get("files")?.as_array()?;
+            let count = |f: &Value| {
+                f.get("diagnostics")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len)
+            };
+            let issues: usize = files.iter().map(count).sum();
+            let (i, f) = (issues, files.len());
+            format!(
+                "Found {i} new diagnostic issue{} in {f} file{}",
+                plural(i),
+                plural(f)
+            )
+        }
+        "goal_status" if a.get("sentinel").and_then(Value::as_bool) != Some(true) => {
+            match (
+                a.get("met").and_then(Value::as_bool)?,
+                s("reason"),
+                s("condition"),
+            ) {
+                (true, _, Some(goal)) => format!("Goal met: {goal}"),
+                (false, Some(why), _) => format!("Goal not met: {why}"),
+                (met, _, _) => format!("Goal {}", if met { "met" } else { "not met" }),
+            }
+        }
+        "task_status" => {
+            let what = s("description").unwrap_or("Background task");
+            match s("status")? {
+                "completed" => format!("{what} completed in background"),
+                "running" => format!("{what} still running in background"),
+                "stopped" => format!("{what} stopped"),
+                other => format!("{what}: {other}"),
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn rendered_text(rendered: Option<&Value>) -> Option<String> {

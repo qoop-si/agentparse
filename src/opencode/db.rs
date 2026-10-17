@@ -182,6 +182,57 @@ pub(super) fn load_v2(
     Ok(rows)
 }
 
+/// Input still waiting in `session_pending` (typed while the session was busy), by admission.
+pub(super) fn load_pending(conn: &Connection, session_id: &str) -> Result<Vec<V2Row>> {
+    if !has_table(conn, "session_pending")? {
+        return Ok(Vec::new());
+    }
+    let query = "SELECT * FROM session_pending WHERE session_id = ?1 ORDER BY admitted_seq";
+    let mut rows = Vec::new();
+    for mut row in rows_as_maps(conn, query, session_id)? {
+        let id = take_str(&mut row, "id").unwrap_or_default();
+        let Some(mut data) = json_data(&mut row) else {
+            continue;
+        };
+        if let Some(delivery) = take_str(&mut row, "delivery") {
+            data.insert("delivery".into(), Value::String(delivery));
+        }
+        rows.push(V2Row {
+            id,
+            ty: take_str(&mut row, "type").unwrap_or_default(),
+            created: take_i64(&mut row, "time_created"),
+            data,
+        });
+    }
+    Ok(rows)
+}
+
+/// The child sessions of `id` as (id, title), oldest first, from either session table.
+pub(super) fn children_of(conn: &Connection, id: &str) -> Result<Vec<(String, String)>> {
+    let mut children: Vec<(String, String)> = Vec::new();
+    for table in ["session_v2", "session"] {
+        if !has_table(conn, table)? || !columns(conn, table)?.iter().any(|c| c == "parent_id") {
+            continue;
+        }
+        let query = format!(
+            "SELECT id, COALESCE(title, '') FROM {table} WHERE parent_id = ?1 ORDER BY time_created, id"
+        );
+        let mut stmt = conn.prepare(&query).map_err(sql_err)?;
+        let rows = stmt
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sql_err)?;
+        for row in rows {
+            let row = row.map_err(sql_err)?;
+            if !children.iter().any(|(c, _)| *c == row.0) {
+                children.push(row);
+            }
+        }
+    }
+    Ok(children)
+}
+
 pub(super) fn todos_entry(conn: &Connection, session_id: &str) -> Result<Option<Entry>> {
     if !has_table(conn, "todo")? {
         return Ok(None);

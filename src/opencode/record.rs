@@ -247,6 +247,7 @@ pub(super) fn failure_entry(
             status: Some("interrupted".into()),
             duration_ms: None,
             error: None,
+            ..Default::default()
         };
         // The interrupt text is the marker, not an error.
         let mut extra = e.rest;

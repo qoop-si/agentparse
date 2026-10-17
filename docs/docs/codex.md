@@ -46,7 +46,7 @@ The envelope looks like this. `ordinal` is dense and starts at 0, and it gives e
 | `task_complete`, `turn_aborted` | `Turn`. The `<turn_aborted>` developer message folds into that one `Turn` |
 | `compacted` | `Compaction`. The record whose `response_id` matches the compaction response becomes `Compaction.usage`, not a message. `replacement_history` goes to `extra` |
 | `thread_rolled_back` | `Rewind` with `turns` |
-| `token_count` (rate limits), `world_state`, `inter_agent_communication_metadata`, a completed `SubAgentActivity`, `task_started` | `Other` |
+| `token_count` (rate limits), `world_state`, `inter_agent_communication_metadata`, `task_started` | `Other` |
 
 The same text can arrive both as an event and as a response item. It is emitted once.
 
@@ -64,6 +64,8 @@ Newer models run tools through a JavaScript program (the custom `exec` tool). Th
 | Child calls | Tool-like items between the call and its output. `name` is the item type (for example `CommandExecution`), `input` is null, and `output.data` is the event |
 | Late command events | Joined to the cell whose output JSON has the same `session_id`, including later `write_stdin` outputs. An item recorded after its cell closed (an interrupted cell, a command that ended with the cell) joins the latest of the last 8 cells whose program runs the same command text more often than the cell has recorded children for it, so it is not an orphan result. Only `Shell` items are matched this way; one that matches no cell stays an orphan result with a warning |
 | Unrecorded commands | A command the sandbox refused before it started records no item. When the program is a plain list of `text(await tools.NAME(ARG));` statements (read by a small literal parser, never evaluated) and the printed items pair with the statements by position, a child is synthesized for every `exec_command` or `write_stdin` whose printed chunk has an `exit_code` and no recorded item: `Tool::Shell` or `Tool::Process`, `shell.exit_code`, `shell.stdout` from the chunk `output`, `Error` for a non-zero code, id `<cell id>#<n>`. A recorded `Shell` child is the call's own when it has the same command text, was not used by an earlier call, and ended with the same exit code, so the same command twice can be one refused call and one that ran. The recorded item replaces a synthetic child only for `Shell` (same command text and exit code). A chunk cut by `Warning: truncated output` that is not valid JSON still gives its `exit_code` (no `stdout`); if the code cannot be read the call gets no child. A cell with no `Script ...` header (aborted) and any other program shape get no synthetic children |
+| Live process | A direct `exec_command` whose output says `Process running with session ID` is `Pending` (no `ended_at`) until a `write_stdin` poll shows the exit or its command item lands. In a cell, a printed chunk with a `session_id` and no `exit_code` becomes a `Pending` child (`shell.background_id`, the partial output); the command item replaces it. A command item no call or cell owns stays an orphan result whose `output.text` is the command's output (`output.data.command` is the argv) |
+| MCP and web items in a cell | `McpToolCall`: `input` is the item's `arguments`, `output.text` the text of `result.content` (or `error.message` when the call never ran). `Extension` web items: `findInPage` is `WebFetch` with the page url and `prompt` set to the pattern, an `other` action with no query reads the page from the first result |
 | Aborted cell | Output text that starts `aborted by user` has no header and makes the cell `Interrupted` |
 | `Tool::Process` | `write_stdin` (write) and `wait` (read, or kill with `terminate`) |
 
@@ -86,7 +88,7 @@ A child thread has its own rollout file.
 | `Session.id` | The child's `payload.id` |
 | `ParentLink.session_id` | `parent_thread_id` |
 | `ParentLink.agent_type` | The agent path or nickname, for example `/root/review` |
-| `ToolCall.child_session` on the parent's `spawn_agent` call | Taken from the `SubAgentActivity` item |
+| `ToolCall.child_session` on the parent's `spawn_agent` call | Taken from the `SubAgentActivity` item. The call is `Pending` until the child's `completed` record (found by `agent_thread_id`) ends it |
 
 A child rollout starts with a copy of history from the parent. Records before `subagent_history_start_ordinal` are dropped, and that ordinal is kept in `Session.extra`.
 

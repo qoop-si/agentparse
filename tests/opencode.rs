@@ -2703,3 +2703,209 @@ fn v2_write_tells_a_created_file_from_an_overwrite() {
     assert_eq!(op("new"), FileOp::Add);
     assert_eq!(op("old"), FileOp::Update);
 }
+
+// Chat parity (running work, queued input, goal and execute tools).
+
+fn bg_block() -> Value {
+    tool_block(
+        "bg",
+        "shell",
+        json!({"status": "completed", "input": {"command": "make", "background": true},
+            "content": [{"type": "text", "text": "Command moved to the background (shell ID: sh_9)"}],
+            "metadata": {"status": "running", "shellID": "sh_9", "truncated": false}}),
+    )
+}
+
+/// The call that started a background job only started it: it runs until the completion row.
+#[test]
+fn a_background_shell_is_pending_until_its_completion_row() {
+    let db = v2_db();
+    insert_v2(
+        &db,
+        0,
+        "assistant",
+        json!({"time": {"created": 100}, "content": [bg_block()]}),
+    );
+    let s = db.parse("ses_v2");
+    let bg = call(&s, "bg");
+    assert_eq!(
+        (
+            bg.status,
+            bg.ended_at,
+            shell(bg).duration_ms,
+            shell(bg).exit_code
+        ),
+        (ToolStatus::Pending, None, None, None)
+    );
+    assert_eq!(shell(bg).background_id.as_deref(), Some("sh_9"));
+    // The completion row ends it, at its own time.
+    let db = background_db(completion("completed", "done", json!({"exit": 0})));
+    let bg = call(&db.parse("ses_v2"), "bg").clone();
+    assert_eq!((bg.status, bg.ended_at), (ToolStatus::Ok, Some(5000)));
+}
+
+fn v2_db_with_children() -> Db {
+    Db::from_sql(
+        "CREATE TABLE session_v2 (id text PRIMARY KEY, parent_id text, directory text NOT NULL, version text NOT NULL, title text, time_created integer NOT NULL, time_updated integer NOT NULL);
+         CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL, time_created integer, time_updated integer, data text);
+         CREATE TABLE session_pending (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, data text NOT NULL, delivery text, admitted_seq integer NOT NULL, time_created integer NOT NULL);
+         INSERT INTO session_v2 VALUES ('ses_v2', NULL, '/w', '2.0.32', NULL, 100, 200);
+         INSERT INTO session_v2 VALUES ('ses_kid_a', 'ses_v2', '/w', '2.0.32', 'scan repo', 110, 200);
+         INSERT INTO session_v2 VALUES ('ses_kid_b', 'ses_v2', '/w', '2.0.32', 'scan repo', 120, 200);
+         INSERT INTO session_v2 VALUES ('ses_kid_c', 'ses_v2', '/w', '2.0.32', 'other', 130, 200);",
+    )
+}
+
+/// A running subagent call has no `sessionID` yet: its child is the parent's session titled with
+/// its description, and a child another call already names is not taken twice.
+#[test]
+fn a_running_subagent_is_linked_to_its_child_by_the_parent_id() {
+    let db = v2_db_with_children();
+    let running = |id: &str, description: &str| {
+        tool_block(
+            id,
+            "subagent",
+            json!({"status": "running", "input": {"agent": "general", "description": description, "prompt": "p"}}),
+        )
+    };
+    let done = tool_block(
+        "done",
+        "subagent",
+        json!({"status": "completed", "input": {"agent": "general", "description": "scan repo", "prompt": "p"},
+            "content": [{"type": "text", "text": "ok"}], "metadata": {"sessionID": "ses_kid_a", "status": "completed"}}),
+    );
+    insert_v2(
+        &db,
+        0,
+        "assistant",
+        json!({"time": {"created": 100}, "content": [done, running("r1", "scan repo"), running("r2", "scan repo"), running("r3", "nothing like it")]}),
+    );
+    let s = db.parse("ses_v2");
+    let got: Vec<_> = ["done", "r1", "r2", "r3"]
+        .iter()
+        .map(|id| (call(&s, id).status, call(&s, id).child_session.clone()))
+        .collect();
+    use ToolStatus::*;
+    assert_eq!(
+        got,
+        [
+            (Ok, Some("ses_kid_a".into())),
+            (Pending, Some("ses_kid_b".into())),
+            (Pending, None),
+            (Pending, None)
+        ]
+    );
+}
+
+/// Input typed while the session was busy waits in `session_pending`.
+#[test]
+fn pending_input_is_a_queued_human_message() {
+    let db = v2_db_with_children();
+    insert_v2(
+        &db,
+        0,
+        "user",
+        json!({"time": {"created": 100}, "text": "first"}),
+    );
+    let conn = db.conn();
+    let add = |id: &str, ty: &str, seq: i64, data: Value| {
+        conn.execute(
+            "INSERT INTO session_pending VALUES (?1, 'ses_v2', ?2, ?3, 'deferred', ?4, 300)",
+            params![id, ty, data.to_string(), seq],
+        )
+        .unwrap();
+    };
+    add(
+        "pend_1",
+        "user",
+        1,
+        json!({"text": "and also this", "time": {"created": 300}}),
+    );
+    add("pend_2", "compaction", 2, json!({"reason": "manual"}));
+    let s = db.parse("ses_v2");
+    let queued: Vec<_> = s
+        .messages()
+        .filter(|m| m.phase.as_deref() == Some("queued"))
+        .collect();
+    let [m] = queued.as_slice() else {
+        panic!("{queued:?}")
+    };
+    assert_eq!(
+        (m.origin, m.text().as_str()),
+        (Origin::Human, "and also this")
+    );
+    let e = s
+        .entries
+        .iter()
+        .find(|e| e.id.as_deref() == Some("pend_1"))
+        .unwrap();
+    assert_eq!(
+        (
+            e.turn_id.as_deref(),
+            e.extra.as_ref().unwrap()["delivery"].as_str()
+        ),
+        (None, Some("deferred"))
+    );
+    assert!(
+        s.entries.iter().any(
+            |e| matches!(&e.kind, EntryKind::Other(o) if o.kind == "session_pending.compaction")
+        )
+    );
+    assert!(
+        s.messages()
+            .filter(|m| m.is_human())
+            .all(|m| m.text() != "and also this" || m.phase.is_some())
+    );
+}
+
+/// Goal plans, `execute` and `question`: typed where the input says enough, input kept.
+#[test]
+fn goal_execute_and_question_tools_are_typed() {
+    let db = v2_db();
+    let block = |id: &str, name: &str, input: Value| {
+        tool_block(
+            id,
+            name,
+            json!({"status": "completed", "input": input, "content": [{"type": "text", "text": "ok"}]}),
+        )
+    };
+    let plan = json!({"goal_id": "g1", "plan": {"phases": [
+        {"id": "p1", "objective": "Greet", "status": "completed"},
+        {"id": "p2", "objective": "Scope", "status": "blocked"}]}});
+    insert_v2(
+        &db,
+        0,
+        "assistant",
+        json!({"time": {"created": 100}, "content": [
+            block("ex", "execute", json!({"code": "return 1"})),
+            block("gp", "update_goal_plan", plan),
+            block("sg", "set_goal", json!({"objective": "ship it"})),
+            block("q", "question", json!({"questions": [{"question": "Which target?", "options": []}]})),
+        ]}),
+    );
+    let s = db.parse("ses_v2");
+    assert_eq!(
+        call(&s, "ex").tool,
+        Tool::Code {
+            source: "return 1".into()
+        }
+    );
+    let Tool::Todo { items } = &call(&s, "gp").tool else {
+        panic!()
+    };
+    let got: Vec<_> = items
+        .iter()
+        .map(|i| (i.content.as_str(), i.status.as_deref()))
+        .collect();
+    assert_eq!(
+        got,
+        [("Greet", Some("completed")), ("Scope", Some("blocked"))]
+    );
+    assert_eq!(call(&s, "sg").tool, Tool::Other);
+    assert_eq!(call(&s, "sg").input["objective"], "ship it");
+    assert_eq!(call(&s, "q").tool, Tool::Question);
+    assert_eq!(
+        call(&s, "q").input["questions"][0]["question"],
+        "Which target?"
+    );
+}

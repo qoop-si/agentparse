@@ -777,14 +777,33 @@ fn mixed_user_record_splits_by_kind() {
     );
 }
 
+/// A prompt with `@file` mentions is the text as typed; the expansion stays in `extra`.
 #[test]
-fn display_content_stays_in_entry_extra() {
-    let rec = json!({"id": "u", "type": "user", "content": [{"text": "expanded"}], "displayContent": [{"text": "@file"}]});
+fn display_content_is_the_human_text() {
+    let rec = json!({"id": "u", "type": "user", "content": [{"text": "explain @a.ts\n<file a.ts>body</file>"}], "displayContent": [{"text": "explain @a.ts"}]});
     let s = jsonl(&[header(), rec]);
+    let m = message(&s, "u");
+    assert_eq!((m.is_human(), m.text().as_str()), (true, "explain @a.ts"));
+    let extra = entry(&s, "u").extra.as_ref().unwrap();
     assert_eq!(
-        entry(&s, "u").extra.as_ref().unwrap()["displayContent"][0]["text"],
-        "@file"
+        extra["content"][0]["text"],
+        "explain @a.ts\n<file a.ts>body</file>"
     );
+    assert!(extra.get("displayContent").is_none());
+    // An empty `displayContent` is no text: the content is the prompt.
+    let rec =
+        json!({"id": "v", "type": "user", "content": [{"text": "plain"}], "displayContent": ""});
+    let s = jsonl(&[header(), rec]);
+    assert_eq!(message(&s, "v").text(), "plain");
+}
+
+/// The compression marker is an `info` with no text: no notice.
+#[test]
+fn an_empty_info_is_no_notice() {
+    let empty = json!({"id": "i1", "type": "info", "content": ""});
+    let full = json!({"id": "i2", "type": "info", "content": "Chat history compressed."});
+    let s = jsonl(&[header(), empty, full]);
+    assert_eq!(ids(&s), ["i2"]);
 }
 
 #[test]
