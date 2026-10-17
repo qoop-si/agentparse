@@ -1834,6 +1834,19 @@ fn hook_prompt_message_and_item_are_one_entry() {
 }
 
 #[test]
+fn hook_additional_context_is_harness_context_not_a_notification() {
+    let record = rec(
+        "response_item",
+        json!({"type": "message", "id": "msg_h2", "role": "developer",
+        "content": [{"type": "input_text", "text": "task record is open"}],
+        "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["hooks.additional_context"]}}),
+    );
+    let s = session(&[record]);
+    assert_eq!(messages(&s, Role::System, Origin::Context).len(), 1);
+    assert!(messages(&s, Role::User, Origin::Notification).is_empty());
+}
+
+#[test]
 fn item_envelopes_keep_their_times() {
     let s = parse("paginated-code-mode.jsonl");
     let first = s

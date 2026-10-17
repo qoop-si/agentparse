@@ -558,7 +558,11 @@ fn classify(role: &str, kind: Option<String>, text: &str, inherited: bool) -> La
             };
             (Role::User, origin, kind.filter(|_| inherited))
         }
-        Some(k) if k.contains("hook") => (Role::User, Origin::Notification, kind),
+        // A hook's extra context for the model is the harness's, like Claude's
+        // `hook_additional_context`; only a hook's own prompt is a notification.
+        Some(k) if k.contains("hook") && !k.ends_with("additional_context") => {
+            (Role::User, Origin::Notification, kind)
+        }
         Some(k) if k.contains("shell_command") => (Role::User, Origin::Command, kind),
         _ if system => (Role::System, Origin::Context, kind),
         _ => (Role::User, Origin::Context, kind),
