@@ -62,6 +62,9 @@ const TYPED_GAP_MS: i64 = 10_000;
 
 const INTERRUPTED: &str = "[Request interrupted by user";
 const CONTINUED: &str = "This session is being continued from a previous conversation";
+/// The line Claude Code puts before a teammate's message it hands over as a prompt, with the
+/// `<teammate-message>` under it.
+const PEER_SENT: &str = "Another Claude session sent a message:";
 
 /// Where an attachment keeps its text when no `rendered` copy was recorded.
 const ATTACHMENT_TEXT: &[&str] = &[
@@ -1459,7 +1462,8 @@ fn classify(text: &str, ctx: &Ctx) -> Class {
     if text.starts_with(INTERRUPTED) {
         return Class::Interrupt;
     }
-    let tag = leading_tag(text);
+    // A teammate's message handed over as a prompt: the tag is under Claude Code's own line.
+    let tag = leading_tag(text.strip_prefix(PEER_SENT).unwrap_or(text));
     let msg = |origin, kind: Option<&str>| Class::Message(origin, kind.map(String::from), None);
     if let Some(tag) = tag.filter(|t| COMMAND_TAGS.contains(t)) {
         return msg(Origin::Command, Some(tag));

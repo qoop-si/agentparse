@@ -1534,6 +1534,13 @@ fn messages_from_other_agents() {
             None,
             json!("<teammate-message teammate_id=\"lead\" summary=\"s\">do x</teammate-message>"),
         ),
+        prompt(
+            "u0",
+            None,
+            json!(
+                "Another Claude session sent a message:\n<teammate-message teammate_id=\"install-login\" color=\"green\" summary=\"s\">\nready</teammate-message>"
+            ),
+        ),
         with(
             "u2",
             json!({"isMeta": true, "origin": {"kind": "coordinator"}}),
@@ -1553,13 +1560,18 @@ fn messages_from_other_agents() {
         got,
         [
             (Origin::Agent, Some("teammate-message"), Some("lead")),
+            (
+                Origin::Agent,
+                Some("teammate-message"),
+                Some("install-login")
+            ),
             (Origin::Agent, Some("coordinator"), None),
             (Origin::Agent, Some("peer"), Some("worker")),
         ]
     );
-    assert_eq!(message(at(&s, 3)).text(), "hello");
+    assert_eq!(message(at(&s, 4)).text(), "hello");
     assert_eq!(
-        at(&s, 3).extra.as_ref().unwrap()["origin"]["from"],
+        at(&s, 4).extra.as_ref().unwrap()["origin"]["from"],
         "session-b"
     );
 }
