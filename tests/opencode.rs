@@ -477,7 +477,7 @@ fn v1_web_todo_task_mcp_and_invalid_tools() {
     );
     let task = call(&s, "call_demo0012");
     assert!(
-        matches!(&task.tool, Tool::Task { description: Some(d), prompt: Some(_), agent_type: Some(a) } if d == "Find failing assertions" && a == "general")
+        matches!(&task.tool, Tool::Task { description: Some(d), prompt: Some(_), agent_type: Some(a), name: None } if d == "Find failing assertions" && a == "general")
     );
     assert_eq!(task.child_session.as_deref(), Some(CHILD));
     // MCP and plugin tools are not typed; the raw name and input stay

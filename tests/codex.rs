@@ -433,6 +433,9 @@ fn subagent_parent_links_its_child() {
     );
     assert_eq!(spawn.child_session.as_deref(), Some(child.id.as_str()));
     assert_eq!(cs[1].child_session.as_deref(), Some(child.id.as_str()));
+    // The agent a message goes to is its `target`.
+    assert!(matches!(&cs[1].tool, Tool::Task { name: Some(n), .. } if n == "review"));
+    assert!(matches!(&spawn.tool, Tool::Task { name: None, .. }));
     assert_eq!(cs[1].output.as_ref().unwrap().text, "");
     assert_eq!(cs[2].status_detail.as_deref(), Some("completed"));
     assert_eq!(

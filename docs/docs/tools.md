@@ -28,7 +28,7 @@ Use `tool` to write code that works for every product. Use `name` and `input` wh
 | `WebFetch` | `url`, `prompt` | Fetching a page |
 | `WebSearch` | `query` | Searching the web |
 | `Todo` | `items` | Writing a task list. Each `TodoItem` has `content`, `status`, `priority` |
-| `Task` | `description`, `prompt`, `agent_type` | Spawning, or sending a message to, a subagent |
+| `Task` | `description`, `prompt`, `agent_type`, `name` | Spawning, or sending a message to, a subagent. `name` is the agent the call names: Claude `Agent` `name` and `SendMessage` `to`, Codex `target` |
 | `Mcp` | `server`, `tool` | A call to an MCP server tool |
 | `Code` | `source` | A JavaScript program the model wrote for the harness to run (Codex code mode) |
 | `Question` | none | Asking the user a question |

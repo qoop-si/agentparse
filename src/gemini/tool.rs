@@ -110,6 +110,7 @@ fn typed(name: &str, args: &Value, has_agent_id: bool) -> Option<Tool> {
             } else {
                 Some(n.to_string())
             },
+            name: None,
         },
         n => {
             // `mcp_<server>_<tool>`: server names may hold `_`, so the split at the first one is a guess.

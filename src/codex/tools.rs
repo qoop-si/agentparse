@@ -514,6 +514,7 @@ pub(super) fn tool_for(name: &str, input: &Value, cwd: Option<String>) -> Tool {
             description: str_field(input, &["task_name", "target", "path_prefix"]),
             prompt: str_field(input, &["message", "prompt"]),
             agent_type: str_field(input, &["agent_type"]),
+            name: str_field(input, &["target"]),
         }),
         n => mcp_tool(n),
     };

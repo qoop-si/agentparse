@@ -454,6 +454,7 @@ fn classify(name: &str, input: &Value, cwd: Option<&str>) -> Tool {
             description: s(&["description"]),
             prompt: s(&["prompt"]),
             agent_type: s(&["subagent_type", "agent"]),
+            name: None,
         }),
         "question" => Some(Tool::Question),
         "execute" => s(&["code"]).map(|source| Tool::Code { source }),

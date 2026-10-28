@@ -141,12 +141,14 @@ fn typed(name: &str, i: &Value, cwd: Option<&str>) -> Option<Tool> {
             description: s(&["description"]),
             prompt: s(&["prompt"]),
             agent_type: s(&["subagent_type"]),
+            name: s(&["name"]),
         },
         // The script is long; the row's text is the launch result's `summary` (`launched`).
         "Workflow" => Tool::Task {
             description: None,
             prompt: None,
             agent_type: Some("workflow".into()),
+            name: None,
         },
         "SendMessage" => Tool::Task {
             description: s(&["summary"]),
@@ -154,6 +156,7 @@ fn typed(name: &str, i: &Value, cwd: Option<&str>) -> Option<Tool> {
                 .get("message")
                 .map(|m| m.as_str().map_or_else(|| m.to_string(), String::from)),
             agent_type: None,
+            name: s(&["to"]),
         },
         "AskUserQuestion" => Tool::Question,
         "EnterPlanMode" | "ExitPlanMode" => Tool::Plan,

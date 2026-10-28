@@ -405,6 +405,9 @@ pub enum Tool {
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_type: Option<String>,
+        /// The agent the call names: the name a spawn gives it, or the one a message goes to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     Mcp {
         server: String,

@@ -2544,3 +2544,33 @@ fn a_compaction_in_a_dead_branch_is_dropped() {
             .any(|w| w.message.starts_with("3 entries on branches"))
     );
 }
+
+/// A named agent and a message to it carry the agent's name: `Agent.name`, `SendMessage.to`.
+#[test]
+fn a_named_agent_and_a_message_to_it_carry_its_name() {
+    let calls = [
+        (
+            "sp",
+            "Agent",
+            json!({"description": "Build E1", "prompt": "p", "name": "e1-langfuse", "run_in_background": true}),
+            json!({"status": "async_launched", "agentId": "ae1-langfuse-14ff", "prompt": "p"}),
+        ),
+        (
+            "sm",
+            "SendMessage",
+            json!({"to": "e1-langfuse", "summary": "E1 accepted", "message": "Merge it."}),
+            json!({"message": "Message sent to e1-langfuse's inbox"}),
+        ),
+    ];
+    let s = transcript(&launched(&calls));
+    let name = |id| match &call(&s, id).tool {
+        Tool::Task { name, .. } => name.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(name("sp").as_deref(), Some("e1-langfuse"));
+    assert_eq!(name("sm").as_deref(), Some("e1-langfuse"));
+    assert!(matches!(
+        &call(&s, "sm").tool,
+        Tool::Task { description: Some(d), .. } if d == "E1 accepted"
+    ));
+}
