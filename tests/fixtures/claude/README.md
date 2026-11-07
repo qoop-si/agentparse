@@ -4,8 +4,9 @@ Small synthetic transcripts for the Claude Code parser. Every value is fake: pro
 test", paths under `/work/demo`, uuid shaped ids with a recognisable prefix, `msg_01Demo...` message ids padded
 with `x`, `toolu_01Demo...` tool ids, short fake base64 signatures. Envelope key names, key order, line
 splitting (one content block per line, several lines sharing one `message.id`), `message` shapes and
-`toolUseResult` shapes follow measurements on 17,826 real transcripts (CLI 2.1.143 to
-2.1.296) and the two fresh real sessions described in `VERIFICATION.md` (CLI 2.1.296: Bash exit 3, Read, Edit). No real
+`toolUseResult` shapes follow a format survey of 17,826 real transcript files (CLI 2.1.143 to
+2.1.296; a separate, earlier scan than the 19,188-session corpus run in `VERIFICATION.md`) and the two fresh
+real sessions described in `VERIFICATION.md` (CLI 2.1.296: Bash exit 3, Read, Edit). No real
 prompt, code, path, username or hostname was copied. Every line parses with `jq` except the two deliberately
 broken lines in `fork-and-corrupt.jsonl`.
 

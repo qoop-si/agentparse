@@ -439,9 +439,10 @@ fn g3_messages_calls_usage() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The two real local sessions
+// Real local sessions under ~/.gemini/tmp, opt in: `cargo test -- --ignored`
 
 #[test]
+#[ignore = "reads the Gemini CLI sessions in your home directory"]
 fn real_local_sessions_parse_and_classify_context() {
     let Some(home) = std::env::var_os("HOME") else {
         return;

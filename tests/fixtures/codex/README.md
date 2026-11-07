@@ -23,7 +23,7 @@ describe the same thing.
 | `legacy-direct-tools.jsonl` | envelope format, no `history_mode`, no `ordinal`, `cli_version` 0.120.0, Extended event persistence | 46 | every direct tool shape, duplicated events, compaction, abort |
 | `flat-era.jsonl` | pre envelope, Rust CLI up to about 0.32 (no `cli_version` is recorded) | 12 | flat first line, bare response items, `record_type: state` lines |
 | `corrupt-tail.jsonl` | 0.162.1 paginated | 12 | a non JSON line in the middle and a truncated last line |
-| `exit3.jsonl` | 0.162.1 paginated, recorded by `codex exec` (see `VERIFICATION.md`) | 29 | a real rollout, sanitized: one cell runs `ls -la`, `sh test.sh` (exit 3, stdout and stderr interleaved) and `cat a.txt`, a second cell runs `apply_patch` (a `FileChange` item) |
+| `exit3.jsonl` | 0.162.1 paginated, recorded by `codex exec` (see `VERIFICATION.md`) | 29 | a recorded rollout, anonymized: one cell runs `ls -la`, `sh test.sh` (exit 3, stdout and stderr interleaved) and `cat a.txt`, a second cell runs `apply_patch` (a `FileChange` item) |
 | `paginated-code-mode.jsonl.zst` | same as `paginated-code-mode.jsonl` | | that file compressed with `zstd -3`, as Codex stores rollouts older than 7 days |
 
 Notes on faithfulness: `legacy-direct-tools.jsonl` is a composite. No real version writes `shell`,
@@ -160,7 +160,7 @@ are plain paths (`PathUri` `file://` is only used by the 0.162 events).
 
 Recorded with `codex exec` 0.162.1 in a scratch repo, then sanitized: paths became `/work/demo`, the prompt,
 every context block and every assistant text became placeholders, `ls -la` output became `total 0\n`, the
-system prompt, `world_state` and account ids became fakes. Ids, ordinals, timestamps, tool records and the
+system prompt, `world_state`, account ids and the session id became fakes. Other ids, ordinals, timestamps, tool records and the
 `sh test.sh` and `cat a.txt` outputs are as recorded.
 
 | Fact | Expected |

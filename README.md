@@ -15,14 +15,14 @@ Docs: https://qoop-si.github.io/agentparse/
 
 ## Install
 
-The crate is not on crates.io yet. Use a git dependency:
+The crate is not on crates.io yet. [qoop](https://github.com/qoop-si/qoop) depends on it the same way. Use a git dependency pinned to a commit, so a later change on `main` cannot alter your build:
 
 ```toml
 [dependencies]
-agentparse = { git = "https://github.com/qoop-si/agentparse" }
+agentparse = { git = "https://github.com/qoop-si/agentparse", rev = "<sha>" }
 ```
 
-Once it is published, `cargo add agentparse` will do. The library needs Rust 1.85 or newer (edition 2024).
+Replace `<sha>` with a full commit hash from this repository. Once the crate is published, `cargo add agentparse` will do. The library needs Rust 1.85 or newer (edition 2024) and a C compiler for the bundled SQLite.
 
 To install the command line tool from a checkout:
 
@@ -122,6 +122,21 @@ A tool call is a part of the assistant message that made it and carries its own 
 | Nothing lost, nothing bulky | Values with no typed field go to `extra` or `data`. Records the model does not cover stay as `Other`. Bad lines become `warnings`. Base64 bodies and encrypted blobs are never stored |
 
 Details: [Usage and Status](https://qoop-si.github.io/agentparse/#conventions).
+
+## Build and test
+
+```bash
+cargo build
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The tests use only the synthetic fixtures under `tests/fixtures`; they never read your own sessions. How the parser was checked against real transcripts: [VERIFICATION.md](VERIFICATION.md).
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report a vulnerability privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
