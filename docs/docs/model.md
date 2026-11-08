@@ -132,7 +132,7 @@ A corrupt JSON line, a bad database row, and a tool result without its call each
 
 | Field | Type | Meaning |
 |---|---|---|
-| `id` | `Option<String>` | The product's id. Claude: the API `message.id` for an assistant message, else the line uuid. Codex: response id, item id, or `ord:<n>`. OpenCode: message or row id. Gemini: message id |
+| `id` | `Option<String>` | The product's id. Claude: the API `message.id` for an assistant message (`<message.id>#2`, `#3` for the pieces after a context line), else the line uuid. Codex: response id, item id, or `ord:<n>`. OpenCode: message or row id. Gemini: message id |
 | `parent_id` | `Option<String>` | Claude only: `parentUuid` resolved to the entry that absorbed that line. Never invented |
 | `turn_id` | `Option<String>` | Turn grouping where recorded: Codex `turn_id`, Claude `promptId`, OpenCode the triggering user message |
 | `ts` | `Option<i64>` | Epoch milliseconds UTC |

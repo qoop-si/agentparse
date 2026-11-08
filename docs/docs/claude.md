@@ -18,11 +18,11 @@ Claude Code writes one JSONL file per session. Every line is one JSON object. ag
 
 ## How lines become entries
 
-Claude Code writes one line per content block, and several lines can share one API `message.id`. agentparse merges those lines back into one assistant message, in file order.
+Claude Code writes one line per content block, and several lines can share one API `message.id`. agentparse merges those lines back into one assistant message, in file order. When a context line (a skill body, an image note) was written between two of them, the message goes on as a new piece below that line, so the order matches what the model saw.
 
 | Source | Becomes |
 |---|---|
-| `assistant` lines with the same `message.id` | One `Message` (role `Assistant`, origin `Model`). `Entry.id` is the `message.id`, and the line ids are listed in `extra.uuids` |
+| `assistant` lines with the same `message.id` | One `Message` (role `Assistant`, origin `Model`). `Entry.id` is the `message.id`, and the line ids are listed in `extra.uuids`. A message split at a context line keeps the bare id on its first piece and continues as `<message.id>#2`, `#3`; the usage sits on the last piece only |
 | `thinking` blocks | `Part::Reasoning`. `encrypted` is true when only a signature was stored |
 | `tool_use` block plus its `tool_result` | One `Part::ToolCall`. The result is folded in by `tool_use_id`. `toolUseResult` fills `ShellResult`, `FileChange` and `ToolOutput.data` |
 | `user` line typed by a person | `Message` with origin `Human` |
@@ -41,9 +41,9 @@ Claude Code writes one line per content block, and several lines can share one A
 | Other placeholder messages from the model `<synthetic>` (such as "No response requested.") | `Notice` with `kind: "synthetic"` |
 | `attachment` lines the UI shows as one line (`file`, `directory`, `nested_memory`, `compact_file_reference`, `invoked_skills`, `diagnostics`, `goal_status`, `task_status`) | `Notice` with the attachment type as `kind` and that line as `text` (`Read a.rs (12 lines)`). The record stays in `extra` |
 | other `attachment` lines with model-visible text | `Message` with origin `Context`. Without such text: `Other` with kind `attachment.<subtype>` |
-| `queue-operation` lines | Replayed in order (enqueue, dequeue, remove, popAll). Input still queued at the end becomes a human message with `phase: "queued"`. Texts that start with `<` are notifications. The raw lines also stay as `Other` |
+| `queue-operation` lines | Replayed in order (enqueue, dequeue, remove, popAll). Input still queued at the end becomes a human message with `phase: "queued"`. Texts that start with `<` are notifications. Texts the harness queues itself (`3 background agents were stopped by the user: ...`, the usage limit reset prompt) take their dequeue like typed input but are never queued human input; the kill words become the text of the `agents_killed` notice. The raw lines also stay as `Other` |
 | `file-history-snapshot`, `last-prompt`, `pr-link`, `worktree-state`, and other metadata lines | `Other` |
-| `TaskCreate`, `TaskUpdate` | `Tool::Todo` with one item (the subject or `#<taskId>`, and its status): the call names one task, not the list |
+| `TaskCreate`, `TaskUpdate` | `Tool::Todo` with one item (the subject, and its status): the call names one task, not the list. A `TaskUpdate` shows the subject once its `TaskCreate` result is known, else `#<taskId>` |
 | `Workflow` | `Tool::Task` with `agent_type: "workflow"`; the description is the `summary` of the launch result |
 | A typed `/compact` (or any slash command) written as a prompt and again as `<command-name>` | One human message: the expanded line is dropped when the human message just before it holds the same text |
 | A prompt sent again after Esc or a rewind | The first try and everything below it are dropped, with a warning, when the sibling prompt is on the chain that goes on (only prompt heads are dropped) |
@@ -54,7 +54,7 @@ Settings entries appear when the working directory, permission mode, effort or a
 
 | Field | Value |
 |---|---|
-| `Entry.id` | `message.id` for a merged assistant message, else the line `uuid` |
+| `Entry.id` | `message.id` for a merged assistant message (`<message.id>#2`, `#3` for its pieces after a context line), else the line `uuid` |
 | `Entry.parent_id` | `parentUuid`, resolved to the entry that absorbed that line. A `tool_result` line maps to the message holding its call |
 | `Entry.turn_id` | The `promptId` of the last user line, carried forward |
 | `Compaction.logical_parent` | `logicalParentUuid`, resolved the same way |
@@ -75,13 +75,15 @@ Each subagent file is its own `Session`.
 |---|---|
 | `Session.id` | The `agentId` |
 | `ParentLink.session_id` | The sidecar `parentAgentId`, else the line `sessionId` |
-| `ParentLink.call_id` | The sidecar `toolUseId` |
-| `ParentLink.agent_type` | The sidecar `agentType` |
+| `ParentLink.call_id` | The sidecar `toolUseId`. A teammate's sidecar names no call: the call id comes from the lead's spawn result that names the agent (by its id, or `<name>@<teamName>` in older files) |
+| `ParentLink.agent_type` | The sidecar `agentType`. `None` for a teammate, whose `agentType` is its name (kept in `extra`) |
 | `ToolCall.child_session` on the parent's call | `toolUseResult.agentId`, or `agent_id`, or the `<task-id>` of an async notification |
 
 ## Background commands
 
 A background launch (`Bash` with `run_in_background`, an async `Agent`, `Monitor`, `Workflow`) is not an outcome: the call is `Pending`, without `ended_at`, and its `backgroundTaskId` (or `agentId`, `taskId`) is indexed. A later task notification message (origin `Notification`) names the call by its tool use id, or by `<task-id>` when it has none, and ends it: `completed` and `done` are `Ok`, `failed` is `Error`, `killed` and `stopped` are `Interrupted`, with the exit code from the summary when it has one. `running` and an agent that reports while its own background work still runs change nothing. Other records end a launch too: a successful `TaskStop`, `system` `agents_killed`, a `turn_duration` whose `pendingBackgroundAgentCount` (or `pendingWorkflowCount`) is 0, a `task_status` attachment, and a Monitor past its `timeout_ms` (judged against the newest record of the file). `BashOutput` and `TaskOutput` calls become `Tool::Process` reads of the same id.
+
+A teammate (an agent spawned with a `name`, `status: "teammate_spawned"`) is not in `pendingBackgroundAgentCount`, so an empty count leaves it `Pending`. It ends on a `TaskStop` that names it (by its name or agent id) or on `agents_killed`, and otherwise stays `Pending`. An idle ping from it sets `status_detail: "idle"` on its spawn call, and its next other message clears that. A subagent's `SubagentHandback` call becomes the final text of the subagent's message, not a tool call.
 
 ## Real example
 

@@ -46,6 +46,8 @@ The envelope looks like this. `ordinal` is dense and starts at 0, and it gives e
 | `task_complete`, `turn_aborted` | `Turn`. The `<turn_aborted>` developer message folds into that one `Turn` |
 | `compacted` | `Compaction`. The record whose `response_id` matches the compaction response becomes `Compaction.usage`, not a message. `replacement_history` goes to `extra` |
 | `thread_rolled_back` | `Rewind` with `turns` |
+| `EnteredReviewMode`, `ExitedReviewMode` items (`/review`) | `Notice` with the item type as `kind`: `Review: <user_facing_hint>`, then `Review done, <overall_correctness>, <n> findings: <overall_explanation>`, or `Review ended without a result` when `review_output` is null (an interrupted review). The item, with the findings, stays in `extra` |
+| Events whose `thread_id` is not the `session_meta` id | Dropped: `codex exec review` copies the review sub-agent's items into the parent, and the child's own rollout holds them. With no `session_meta` (a tail window) nothing is dropped |
 | `token_count` (rate limits), `world_state`, `inter_agent_communication_metadata`, `task_started` | `Other` |
 
 The same text can arrive both as an event and as a response item. It is emitted once.
@@ -62,7 +64,7 @@ Newer models run tools through a JavaScript program (the custom `exec` tool). Th
 |---|---|
 | Cell call | `Tool::Code` with the program in `source`. Its status comes from the output header (`Script completed`, `Script failed`, `Script terminated`, `Script running with cell ID`) |
 | Child calls | Tool-like items between the call and its output. `name` is the item type (for example `CommandExecution`), `input` is null, and `output.data` is the event |
-| Late command events | Joined to the cell whose output JSON has the same `session_id`, including later `write_stdin` outputs. An item recorded after its cell closed (an interrupted cell, a command that ended with the cell) joins the latest of the last 8 cells whose program runs the same command text more often than the cell has recorded children for it, so it is not an orphan result. Only `Shell` items are matched this way; one that matches no cell stays an orphan result with a warning |
+| Late command events | Joined to the cell whose output JSON has the same `session_id` (also as the `value` of a printed `Promise.allSettled` result), including later `write_stdin` outputs. An item recorded after its cell closed (an interrupted cell, a command that ended with the cell) joins the latest of the last 8 cells whose program runs the same command text more often than the cell has recorded children for it, so it is not an orphan result. Only `Shell` items are matched this way; one that matches no cell stays an orphan result with a warning |
 | Unrecorded commands | A command the sandbox refused before it started records no item. When the program is a plain list of `text(await tools.NAME(ARG));` statements (read by a small literal parser, never evaluated) and the printed items pair with the statements by position, a child is synthesized for every `exec_command` or `write_stdin` whose printed chunk has an `exit_code` and no recorded item: `Tool::Shell` or `Tool::Process`, `shell.exit_code`, `shell.stdout` from the chunk `output`, `Error` for a non-zero code, id `<cell id>#<n>`. A recorded `Shell` child is the call's own when it has the same command text, was not used by an earlier call, and ended with the same exit code, so the same command twice can be one refused call and one that ran. The recorded item replaces a synthetic child only for `Shell` (same command text and exit code). A chunk cut by `Warning: truncated output` that is not valid JSON still gives its `exit_code` (no `stdout`); if the code cannot be read the call gets no child. A cell with no `Script ...` header (aborted) and any other program shape get no synthetic children |
 | Live process | A direct `exec_command` whose output says `Process running with session ID` is `Pending` (no `ended_at`) until a `write_stdin` poll shows the exit or its command item lands. In a cell, a printed chunk with a `session_id` and no `exit_code` becomes a `Pending` child (`shell.background_id`, the partial output); the command item replaces it. A command item no call or cell owns stays an orphan result whose `output.text` is the command's output (`output.data.command` is the argv) |
 | MCP and web items in a cell | `McpToolCall`: `input` is the item's `arguments`, `output.text` the text of `result.content` (or `error.message` when the call never ran). `Extension` web items: `findInPage` is `WebFetch` with the page url and `prompt` set to the pattern, an `other` action with no query reads the page from the first result |
@@ -87,7 +89,7 @@ A child thread has its own rollout file.
 |---|---|
 | `Session.id` | The child's `payload.id` |
 | `ParentLink.session_id` | `parent_thread_id` |
-| `ParentLink.agent_type` | The agent path or nickname, for example `/root/review` |
+| `ParentLink.agent_type` | The agent path or nickname, for example `/root/review`, else the `source.subagent` string (`review`). A `review` child's user prompts are origin `Command`, and the first one is its `title` |
 | `ToolCall.child_session` on the parent's `spawn_agent` call | Taken from the `SubAgentActivity` item. The call is `Pending` until the child's `completed` record (found by `agent_thread_id`) ends it |
 
 A child rollout starts with a copy of history from the parent. Records before `subagent_history_start_ordinal` are dropped, and that ordinal is kept in `Session.extra`.
@@ -149,6 +151,6 @@ The `0.8s` under the code cell is the cell's own run time. The three shell comma
 | Limit | Detail |
 |---|---|
 | One stream | No separate stderr. See above |
-| Titles | A rollout carries no title, so `title` is the first human prompt |
+| Titles | A rollout carries no title, so `title` is the first human prompt. A `review` child takes its review prompt; a session with no human prompt and a `/review` (a `codex exec review` parent) takes the `Review: <user_facing_hint>` notice |
 | Older shapes are tested on built fixtures | The newest generation has been checked against real rollouts. Older shapes (flat, legacy, direct `shell` calls, `local_shell_call`, `apply_patch`, MCP calls, compaction) are covered by fixtures built from the record types Codex defines |
 | Earlier history | A child rollout or a compressed rollout can start mid-history. A warning says so when the file records it |

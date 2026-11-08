@@ -31,7 +31,7 @@ Use `tool` to write code that works for every product. Use `name` and `input` wh
 | `Task` | `description`, `prompt`, `agent_type`, `name` | Spawning, or sending a message to, a subagent. `name` is the agent the call names: Claude `Agent` `name` and `SendMessage` `to`, Codex `target` |
 | `Mcp` | `server`, `tool` | A call to an MCP server tool |
 | `Code` | `source` | A JavaScript program the model wrote for the harness to run (Codex code mode) |
-| `Question` | none | Asking the user a question |
+| `Question` | `questions`, `declined` | Asking the user questions. Each `Asked` has `header`, `question`, `options` (`label`, `description`) and `answer`, the user's choice or own text once known. `declined` is set when the user turned the questions down. Claude and Codex fill `questions`; OpenCode and Gemini leave both empty. A Claude "clarify" choice is status `Ok` with status detail `clarify` |
 | `Plan` | none | Entering or leaving plan mode |
 | `Skill` | `name` | Loading a skill |
 | `Other` | none | Everything else. The raw `input` is still there |
@@ -69,7 +69,7 @@ Which recorded tool name becomes which `Tool`. "none" means the product has no s
 | `Task` | `Task`, `Agent`, `SendMessage` | `spawn_agent`, `send_message`, `followup_task`, `wait_agent` | `task` / `subagent` | `invoke_agent`, and agent tools called with an `agentId` |
 | `Mcp` | `mcp__<server>__<tool>` | `mcp__<server>__<tool>`, and the `McpToolCall` item | not typed (the names are ambiguous with plugin tools) | `mcp_<server>_<tool>`, split at the first `_` after `mcp_`. The raw name is kept |
 | `Code` | none | the custom `exec` tool (code mode) | none | none |
-| `Question` | `AskUserQuestion` | `request_user_input` | `question` | `ask_user` |
+| `Question` | `AskUserQuestion` | `request_user_input`, `request_user_input_async` | `question` | `ask_user` |
 | `Plan` | `EnterPlanMode`, `ExitPlanMode` | none (a Codex plan item is assistant text) | `plan_enter`, `plan_exit` | `enter_plan_mode`, `exit_plan_mode` |
 | `Skill` | `Skill`, `SlashCommand` | none | `skill` | `activate_skill` |
 | `Other` | `NotebookEdit`, `ToolSearch`, and everything else. | everything else | `invalid`, plugin tools, MCP tools | `read_many_files`, `save_memory`, tracker tools, and everything else |

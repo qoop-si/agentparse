@@ -412,7 +412,7 @@ fn describe(c: &ToolCall) -> String {
         Tool::Mcp { server, tool } => format!("mcp {server}/{tool}"),
         Tool::Code { source } => format!("code cell ({} lines)", source.lines().count()),
         Tool::Skill { name } => format!("skill {}", name.as_deref().unwrap_or("?")),
-        Tool::Question | Tool::Plan | Tool::Other => c.name.clone(),
+        Tool::Question { .. } | Tool::Plan | Tool::Other => c.name.clone(),
     }
 }
 

@@ -2903,7 +2903,7 @@ fn goal_execute_and_question_tools_are_typed() {
     );
     assert_eq!(call(&s, "sg").tool, Tool::Other);
     assert_eq!(call(&s, "sg").input["objective"], "ship it");
-    assert_eq!(call(&s, "q").tool, Tool::Question);
+    assert!(matches!(call(&s, "q").tool, Tool::Question { .. }));
     assert_eq!(
         call(&s, "q").input["questions"][0]["question"],
         "Which target?"

@@ -1368,7 +1368,7 @@ fn tool_names_beyond_files_and_shell() {
     }
     assert!(matches!(
         typed("ask_user", json!({"questions": []})),
-        Tool::Question
+        Tool::Question { .. }
     ));
     assert!(matches!(typed("enter_plan_mode", json!({})), Tool::Plan));
     assert!(matches!(

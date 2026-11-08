@@ -12,8 +12,8 @@ use crate::util::{
     u64_field,
 };
 use crate::{
-    EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Shell, ShellResult, Source,
-    TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus,
+    Asked, EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Shell, ShellResult,
+    Source, TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus,
 };
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom};
@@ -508,7 +508,10 @@ pub(super) fn tool_for(name: &str, input: &Value, cwd: Option<String>) -> Tool {
             offset: None,
             limit: None,
         }),
-        "request_user_input" => Some(Tool::Question),
+        "request_user_input" | "request_user_input_async" => Some(Tool::Question {
+            questions: Asked::from_input(input),
+            declined: false,
+        }),
         "web_search_call" | "web_search" => Some(web_action(Some(input), None, None)),
         n if COLLAB_TOOLS.contains(&n) || n == "wait" => Some(Tool::Task {
             description: str_field(input, &["task_name", "target", "path_prefix"]),
