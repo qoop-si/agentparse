@@ -132,7 +132,8 @@ pub struct Warning {
 /// One item of the session timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Product id: Claude `message.id` for a merged assistant message, else the line uuid; Codex
+    /// Product id: Claude `message.id` for a merged assistant message (`<message.id>#2`, `#3`
+    /// for the pieces it goes on in after a context line), else the line uuid; Codex
     /// response id, item id or `ord:<n>`; OpenCode message or row id; Gemini message id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -417,13 +418,40 @@ pub enum Tool {
     Code {
         source: String,
     },
-    Question,
+    /// Questions put to the user. A Gemini or OpenCode question leaves both fields empty.
+    Question {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<Asked>,
+        /// The user turned the questions down.
+        #[serde(default, skip_serializing_if = "is_false")]
+        declined: bool,
+    },
     Plan,
     Skill {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     Other,
+}
+
+/// One question of a [`Tool::Question`] call, with the user's answer once it is known.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Asked {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AskedOption>,
+    /// The chosen labels (joined with `, ` when several) or the user's own text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -890,6 +918,37 @@ impl ToolCall {
             self.status,
             ToolStatus::Error | ToolStatus::Rejected | ToolStatus::Interrupted
         )
+    }
+}
+
+impl Asked {
+    /// The `questions` of a question call's input: `question` (Claude, Codex) or `title` (Codex
+    /// async), `header`, and each option's `label` and `description`.
+    pub(crate) fn from_input(input: &Value) -> Vec<Asked> {
+        let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(String::from);
+        let questions = input.get("questions").and_then(Value::as_array);
+        questions
+            .into_iter()
+            .flatten()
+            .filter_map(|q| {
+                let options = q.get("options").and_then(Value::as_array);
+                Some(Asked {
+                    header: text(q, "header"),
+                    question: text(q, "question").or_else(|| text(q, "title"))?,
+                    options: options
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|o| {
+                            Some(AskedOption {
+                                label: text(o, "label")?,
+                                description: text(o, "description"),
+                            })
+                        })
+                        .collect(),
+                    answer: None,
+                })
+            })
+            .collect()
     }
 }
 

@@ -9,8 +9,8 @@
 //! sessions) are the caller's to dedupe, so `Session.usage` of a resumed file includes them.
 
 use crate::util::{
-    Obj, as_extra, base64_len, bool_field, join_texts, json_lines, stripped, take_array, take_bool,
-    take_obj, take_str, take_u64, take_with, ts_ms,
+    Obj, as_extra, base64_len, bool_field, join_texts, json_lines, str_field, stripped, take_array,
+    take_bool, take_obj, take_str, take_u64, take_with, ts_ms,
 };
 use crate::{
     Agent, Compaction, Entry, EntryKind, Error, ErrorInfo, Git, Hook, Media, Message, Notice,
@@ -59,6 +59,9 @@ const COMMAND_TAGS: &[&str] = &[
 
 /// How far apart a typed slash command and its expanded line can be written.
 const TYPED_GAP_MS: i64 = 10_000;
+
+/// How long before its `agents_killed` record the harness queues the words of the kill.
+const KILL_GAP_MS: i64 = 1_000;
 
 const INTERRUPTED: &str = "[Request interrupted by user";
 const CONTINUED: &str = "This session is being continued from a previous conversation";
@@ -125,8 +128,13 @@ struct Parser {
     messages: HashMap<String, usize>,
     /// `tool_use` id to (entry index, part index).
     calls: HashMap<String, (usize, usize)>,
-    /// Background task id (shell, agent, monitor, workflow) to the call that launched it.
+    /// Background task id (shell, agent, monitor, workflow) to the call that launched it; a named
+    /// agent (a teammate) is here under its name too.
     tasks: HashMap<String, (usize, usize)>,
+    /// Task list number to its subject, from `Task #N created successfully: <subject>`.
+    todos: HashMap<String, String>,
+    /// `SubagentHandback` call id to the entry its report became the text of.
+    handbacks: HashMap<String, usize>,
     /// Latest title per line type (`custom-title`, `agent-name`, `ai-title`, `summary`).
     titles: Obj,
     cost: Option<Obj>,
@@ -362,23 +370,29 @@ impl Parser {
         }
         dedupe_wire_inputs(&mut rec, &parts);
 
-        let idx = match self.messages.get(&id) {
-            Some(&idx) => {
+        let idx = match self.messages.get(&id).copied() {
+            Some(idx) if !self.user_line_after(idx) => {
                 self.continuation(idx, &head, &parts);
                 idx
             }
-            None => {
-                let idx = self.push(
-                    &head,
-                    Some(id.clone()),
-                    None,
-                    EntryKind::Message(Message::new(Role::Assistant, Origin::Model, Vec::new())),
-                );
+            earlier => {
+                // A message that goes on after a user line continues as a piece of its own
+                // (`<id>#2`, ...) below that line; the usage moves on with it, so it counts once.
+                let (entry_id, usage) = match earlier {
+                    Some(idx) => self.split_off(idx, &id),
+                    None => (id.clone(), None),
+                };
+                let msg = Message {
+                    usage,
+                    ..Message::new(Role::Assistant, Origin::Model, Vec::new())
+                };
+                let idx = self.push(&head, Some(entry_id), None, EntryKind::Message(msg));
                 self.messages.insert(id.clone(), idx);
                 idx
             }
         };
         let Entry {
+            id: entry_id,
             kind: EntryKind::Message(m),
             extra,
             ..
@@ -387,8 +401,24 @@ impl Parser {
             return;
         };
         let mut calls = Vec::new();
-        for (p, rest) in parts {
-            if let Part::ToolCall(c) = &p {
+        for (mut p, rest) in parts {
+            if let Part::ToolCall(c) = &mut p {
+                // A subagent's report handed back to its caller is its last word, not a call.
+                if let ("SubagentHandback", Some(text)) =
+                    (c.name.as_str(), str_field(&c.input, &["message"]))
+                {
+                    self.handbacks.insert(c.id.clone(), idx);
+                    m.parts.push(Part::Text { text });
+                    continue;
+                }
+                if let (Tool::Todo { items }, "TaskUpdate") = (&mut c.tool, c.name.as_str()) {
+                    for item in items {
+                        let n = item.content.strip_prefix('#');
+                        if let Some(subject) = n.and_then(|n| self.todos.get(n)) {
+                            item.content = subject.clone();
+                        }
+                    }
+                }
                 self.calls.insert(c.id.clone(), (idx, m.parts.len()));
                 calls.push((c.id.clone(), rest));
             }
@@ -414,14 +444,37 @@ impl Parser {
         for (call_id, rest) in &mut calls {
             call_extra(extra, call_id, "call", std::mem::take(rest));
         }
-        if let Some(uuid) = head.uuid {
-            self.uuids.entry(uuid).or_insert(id);
+        if let (Some(uuid), Some(entry_id)) = (head.uuid, entry_id.clone()) {
+            self.uuids.entry(uuid).or_insert(entry_id);
         }
         for (call_id, _) in calls {
             if let Some(held) = self.pending.remove(&call_id) {
                 self.fold(call_id, held);
             }
         }
+    }
+
+    /// A context line (a skill body, an image note: part of a call's result) was written after
+    /// the message at `idx` began. Not a teammate's message: written while one response still
+    /// streams, it reaches the model only with the next request (fefc1886 lines 1125-1127).
+    fn user_line_after(&self, idx: usize) -> bool {
+        self.entries[idx + 1..].iter().any(|e| {
+            matches!(&e.kind, EntryKind::Message(m) if m.role == Role::User && m.origin == Origin::Context)
+        })
+    }
+
+    /// The id of the next piece of message `id`, whose latest piece is at `idx`, and the usage
+    /// taken off that piece.
+    fn split_off(&mut self, idx: usize, id: &str) -> (String, Option<Usage>) {
+        let entry = &mut self.entries[idx];
+        let n = (entry.id.as_deref())
+            .and_then(|e| e.strip_prefix(id)?.strip_prefix('#')?.parse::<usize>().ok())
+            .unwrap_or(1);
+        let usage = match &mut entry.kind {
+            EntryKind::Message(m) => m.usage.take(),
+            _ => None,
+        };
+        (format!("{id}#{}", n + 1), usage)
     }
 
     /// A later line of a merged message keeps its own parent and timestamp in
@@ -542,6 +595,13 @@ impl Parser {
                 continue;
             };
             let call_id = take_str(&mut block, "tool_use_id").unwrap_or_default();
+            // The ack of a hand-back says only that it was delivered.
+            if let Some(&entry) = self.handbacks.get(&call_id) {
+                if let Some(rest) = rest.take() {
+                    self.absorb_result_line(head, rest, entry, &call_id);
+                }
+                continue;
+            }
             let held = Held {
                 head: head.clone(),
                 turn: self.turn.clone(),
@@ -571,7 +631,7 @@ impl Parser {
             rest,
             ..
         } = held;
-        let mut launched = None;
+        let mut launched = Vec::new();
         let mut stopped = None;
         if let Some(call) = call_at(&mut self.entries[entry], part) {
             let o = outcome(&call.name, &call.input, block, tur, denial);
@@ -587,7 +647,18 @@ impl Parser {
             }
             launch_summary(call);
             if call.status == ToolStatus::Pending {
-                launched = task_id(call).map(String::from);
+                launched.extend(task_id(call).map(String::from));
+                // A TaskStop names a teammate (or a named background agent) by its name too.
+                if let Tool::Task {
+                    name: Some(name), ..
+                } = &call.tool
+                {
+                    launched.push(name.clone());
+                }
+            }
+            if call.name == "TaskCreate" {
+                let created = call.output.as_ref().and_then(|o| created_task(&o.text));
+                self.todos.extend(created);
             }
             if let (
                 Tool::Process {
@@ -601,7 +672,7 @@ impl Parser {
                 stopped = Some(id.clone());
             }
         }
-        if let Some(id) = launched {
+        for id in launched {
             self.tasks.insert(id, (entry, part));
         }
         if let Some(id) = stopped {
@@ -834,10 +905,14 @@ impl Parser {
         else {
             return;
         };
+        let (text, ts) = (m.text(), *ts);
+        if m.origin == Origin::Agent {
+            self.idle_pings(&text);
+            return;
+        }
         if m.origin != Origin::Notification {
             return;
         }
-        let (text, ts) = (m.text(), *ts);
         for note in text.split("<task-notification>").skip(1) {
             let by_call = tag_body(note, "tool-use-id").and_then(|id| self.calls.get(id));
             let by_task = tag_body(note, "task-id").and_then(|id| self.tasks.get(id));
@@ -846,6 +921,30 @@ impl Parser {
             };
             if let Some(call) = call_at(&mut self.entries[entry], part) {
                 apply_notification(call, note, ts);
+            }
+        }
+    }
+
+    /// A teammate that went idle still runs (the next message wakes it): its spawn says `idle`
+    /// until the teammate sends anything else.
+    fn idle_pings(&mut self, text: &str) {
+        for note in text.split("<teammate-message").skip(1) {
+            let idle = note
+                .split("</teammate-message>")
+                .next()
+                .is_some_and(|body| body.contains("\"type\":\"idle_notification\""));
+            let Some(&(entry, part)) =
+                attr(note, "teammate_id").and_then(|name| self.tasks.get(&name))
+            else {
+                continue;
+            };
+            let call = call_at(&mut self.entries[entry], part);
+            if let Some(call) = call.filter(|c| c.status == ToolStatus::Pending) {
+                if idle {
+                    call.status_detail = Some("idle".into());
+                } else if call.status_detail.as_deref() == Some("idle") {
+                    call.status_detail = None;
+                }
             }
         }
     }
@@ -863,13 +962,18 @@ impl Parser {
         }
     }
 
-    /// End every launched agent (or workflow) still running, when the harness says none is left.
+    /// End every launched agent (or workflow) still running, when the harness says none is left
+    /// (`ended`) or the user stopped them all (`killed`). Teammates are not in the count, so an
+    /// empty count leaves them running; a kill stops them too (6332d703 line 8301 names three).
     fn end_agents(&mut self, workflows: bool, status: &str, ts: Option<i64>) {
         for &(entry, part) in self.tasks.values() {
             let Some(call) = call_at(&mut self.entries[entry], part) else {
                 continue;
             };
-            let agent = matches!(call.tool, Tool::Task { .. });
+            let teammate = (call.output.as_ref())
+                .and_then(|o| o.data.as_ref()?.get("status"))
+                .is_some_and(|s| s == "teammate_spawned");
+            let agent = matches!(call.tool, Tool::Task { .. }) && !(teammate && status == "ended");
             if agent && (call.name == "Workflow") == workflows && call.status == ToolStatus::Pending
             {
                 apply_notification(call, &format!("<status>{status}</status>"), ts);
@@ -966,7 +1070,10 @@ impl Parser {
         let human = !meta
             && match kind.as_deref() {
                 Some(k) => k == "human",
-                None => !content_text(&prompt).trim_start().starts_with('<'),
+                None => {
+                    let text = content_text(&prompt);
+                    !text.trim_start().starts_with('<') && !is_harness_text(&text)
+                }
             };
         let parts = match prompt {
             Value::String(text) => vec![Part::Text { text }],
@@ -1074,6 +1181,8 @@ impl Parser {
 
     fn system(&mut self, head: Head, mut rec: Obj) {
         let sub = take_str(&mut rec, "subtype").unwrap_or_default();
+        let killed = sub == "agents_killed";
+        let queued = killed.then(|| self.killed_text(head.ts)).flatten();
         let kind = match sub.as_str() {
             "turn_duration" => EntryKind::Turn(Turn {
                 duration_ms: take_u64(&mut rec, "durationMs"),
@@ -1105,7 +1214,7 @@ impl Parser {
             _ => EntryKind::Notice(Notice {
                 level: take_str(&mut rec, "level"),
                 kind: (!sub.is_empty()).then(|| sub.clone()),
-                text: take_str(&mut rec, "content").unwrap_or_default(),
+                text: take_str(&mut rec, "content").or(queued).unwrap_or_default(),
             }),
         };
         let pending = match &kind {
@@ -1118,7 +1227,6 @@ impl Parser {
             self.compaction = Some(at);
         }
         // A turn that ends with none left means the earlier launches are over, report or not.
-        let killed = sub == "agents_killed";
         let status = if killed { "killed" } else { "ended" };
         if killed || pending.0 == Some(0) {
             self.end_agents(false, status, head.ts);
@@ -1240,8 +1348,19 @@ impl Parser {
         if let Some(path) = path {
             *meta = self.meta(path).unwrap_or_default();
         }
-        let call_id = take_str(meta, "toolUseId");
-        let agent_type = take_str(meta, "agentType");
+        // A teammate's meta names no call, and its `agentType` is its name (kept in the meta).
+        let teammate = meta.get("taskKind").and_then(Value::as_str) == Some("in_process_teammate");
+        let call_id = take_str(meta, "toolUseId").or_else(|| {
+            let lead = path.filter(|_| teammate)?.parent()?.parent()?;
+            // An older spawn names it `<name>@<teamName>` (e857d7c5 line 1110), never its id.
+            let field = |k| meta.get(k).and_then(Value::as_str);
+            let address = match (field("name"), field("teamName")) {
+                (Some(name), Some(team)) => format!("{name}@{team}"),
+                _ => agent_id.clone(),
+            };
+            spawn_call(&lead.with_extension("jsonl"), &[&agent_id, &address])
+        });
+        let agent_type = (!teammate).then(|| take_str(meta, "agentType")).flatten();
         let parent = match take_str(meta, "parentAgentId") {
             Some(parent) => {
                 extra.extend(session_id.map(|s| ("sessionId".to_string(), Value::String(s))));
@@ -1294,10 +1413,26 @@ impl Parser {
         }
     }
 
-    /// Human input still queued at the end, right after the record that queued it.
+    /// The words of an `agents_killed` record, which has none of its own, read from the queue:
+    /// the harness queues them the same moment (6332d703 line 8301) or a millisecond before
+    /// (xheron 53b86fc1 line 66460).
+    fn killed_text(&self, ts: Option<i64>) -> Option<String> {
+        let ts = ts?;
+        let at = (self.queue.iter()).rposition(|(at, text)| {
+            let gap = self.entries[*at].ts.map(|t| ts - t);
+            gap.is_some_and(|g| (0..=KILL_GAP_MS).contains(&g)) && stopped_text(text)
+        })?;
+        // Left queued: a later dequeue takes them, not the typed text behind them, and
+        // `flush_queue` drops harness text.
+        self.queue.get(at).map(|(_, text)| text.clone())
+    }
+
+    /// Human input still queued at the end, right after the record that queued it. Harness text
+    /// stays in the queue until then, since it takes its dequeue like typed input.
     fn flush_queue(&mut self) {
         let queue = std::mem::take(&mut self.queue);
-        for (at, text) in queue.into_iter().rev() {
+        let typed = queue.into_iter().filter(|(_, text)| !is_harness_text(text));
+        for (at, text) in typed.rev() {
             let src = &self.entries[at];
             let msg = Message {
                 phase: Some("queued".into()),
@@ -1552,6 +1687,49 @@ fn part(block: Value, cwd: Option<&str>, ts: Option<i64>) -> (Part, Obj) {
 /// Text a person typed into the queue; `<...>` texts are notifications.
 fn is_human_text(text: &str) -> bool {
     !text.trim().is_empty() && !text.trim_start().starts_with('<')
+}
+
+/// Untagged text the harness queues as if typed: `3 background agents were stopped by the
+/// user: ...` (with `agents_killed`) and the usage limit reset prompt.
+fn is_harness_text(text: &str) -> bool {
+    stopped_text(text) || text.starts_with("Your claude.ai usage limit has reset.")
+}
+
+/// `3 background agents were stopped by the user: ...`, the words of an `agents_killed`.
+fn stopped_text(text: &str) -> bool {
+    let count = text.trim_start_matches(|c: char| c.is_ascii_digit());
+    count.len() < text.len()
+        && count.starts_with(" background ")
+        && count.contains(" stopped by the user")
+}
+
+/// The spawn call of a teammate in the lead's transcript: the first result that names the agent
+/// (by any of `names`) is its spawn acknowledgement.
+fn spawn_call(lead: &Path, names: &[&str]) -> Option<String> {
+    // ponytail: one scan of the lead file per teammate file parse; index it if that shows up.
+    let file = std::io::BufReader::new(std::fs::File::open(lead).ok()?);
+    file.lines()
+        .map_while(std::io::Result::ok)
+        .find_map(|line| {
+            if !line.contains("\"tool_use_id\"") || !names.iter().any(|n| line.contains(n)) {
+                return None;
+            }
+            let rec: Value = serde_json::from_str(&line).ok()?;
+            let blocks = rec.pointer("/message/content")?.as_array()?;
+            blocks.iter().find_map(|b| {
+                let content = b.get("content")?.to_string();
+                let named = names.iter().any(|n| content.contains(n));
+                named.then(|| b.get("tool_use_id")?.as_str().map(String::from))?
+            })
+        })
+}
+
+/// `Task #5 created successfully: Phase 0` to (`5`, `Phase 0`).
+fn created_task(text: &str) -> Option<(String, String)> {
+    let (n, subject) = text
+        .strip_prefix("Task #")?
+        .split_once(" created successfully: ")?;
+    Some((n.to_string(), subject.trim().to_string()))
 }
 
 /// Leftover keys of one call's source record in `extra.calls.<call_id>.<key>` (`call` for the

@@ -2378,3 +2378,30 @@ fn a_spawn_closes_when_the_childs_last_turn_ended() {
     assert_eq!(got, [Interrupted, Ok, Pending, Pending]);
     assert_eq!(calls(&s)[0].status_detail.as_deref(), Some("ended"));
 }
+
+/// gap 4: rollout 2026-10-26T01-41-08 lines 75-78, `request_user_input_async` with a `title`
+/// key is a question like `request_user_input`.
+#[test]
+fn async_user_input_request_is_a_question() {
+    let title = "The three supplied round-1 files do not define R2, R3, R5, or R8. Where are those four findings recorded?";
+    let args = json!({"questions": [{"title": title}]}).to_string();
+    let s = session(&[
+        rec(
+            "response_item",
+            json!({"type": "function_call", "name": "request_user_input_async", "arguments": args, "call_id": "call_q"}),
+        ),
+        rec(
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "call_q", "output": "{\"accepted\":true}"}),
+        ),
+    ]);
+    let c = calls(&s)
+        .into_iter()
+        .find(|c| c.id == "call_q")
+        .expect("question call");
+    let tool = serde_json::to_value(&c.tool).unwrap();
+    assert_eq!(
+        (&tool["kind"], &tool["questions"][0]["question"]),
+        (&json!("question"), &json!(title))
+    );
+}

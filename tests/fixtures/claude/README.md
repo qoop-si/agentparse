@@ -17,7 +17,13 @@ tests/fixtures/claude/
   main-session/subagents/agent-a1b2c3d4e5f607182.meta.json    sidecar (one JSON object, not JSONL)
   old-format.jsonl                                            20 lines, RECONSTRUCTED, not measured
   fork-and-corrupt.jsonl                                      12 lines, 2 of them broken on purpose
+  outcomes/workflow-text-launch.jsonl                         2 lines, REAL (see below)
 ```
+
+`outcomes/workflow-text-launch.jsonl` is the one real copy: a Workflow call and its result line with no
+`toolUseResult` (CLI 2.1.156, crw-opencore session `1c97d622` lines 59-60), kept because the launch text itself is
+under test. Only the user folder in paths (`/Users/demo`), the Workflow script (one line) and one dash (a comma) were changed.
+`tests/claude_outcomes.rs` uses it.
 
 `main-session.jsonl` is over the 80 line guideline on purpose: the brief needs about 35 distinct shapes and
 every tool call costs two lines.

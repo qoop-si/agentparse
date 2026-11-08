@@ -28,10 +28,10 @@
 //! inputs), `results` (what outputs, completion events and tool items say), `js` (the cell
 //! program reader), `json` (helpers).
 
-use crate::util::{Obj, as_extra, json_lines, obj_str, str_field, take_str, ts_ms};
+use crate::util::{Obj, as_extra, json_lines, obj_str, one_line, str_field, take_str, ts_ms};
 use crate::{
-    Agent, Compaction, Entry, EntryKind, Error, ErrorInfo, Other, ParentLink, Part, Result, Rewind,
-    Role, Session, Settings, Source, Turn,
+    Agent, Compaction, Entry, EntryKind, Error, ErrorInfo, Notice, Origin, Other, ParentLink, Part,
+    Result, Rewind, Role, Session, Settings, Source, Turn,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -129,6 +129,8 @@ struct Parser {
     start_ordinal: u64,
     /// This session's multi-agent path; inter-agent messages from it are its own.
     own_path: String,
+    /// A `/review` sub-agent: its user prompts are the harness's review command.
+    review: bool,
     model: Option<String>,
     turn: Option<String>,
     settings: Option<Settings>,
@@ -174,6 +176,7 @@ impl Parser {
             meta_seen: false,
             start_ordinal: 0,
             own_path: "/root".into(),
+            review: false,
             model: None,
             turn: None,
             settings: None,
@@ -274,7 +277,13 @@ impl Parser {
 
     fn event(&mut self, mut p: Obj) {
         let ty = take_str(&mut p, "type").unwrap_or_default();
-        p.remove("thread_id");
+        // `codex exec review` writes the review sub-agent's items into the parent too, tagged with
+        // the child's thread; the child's own file holds them. The id is `session_meta`'s, empty
+        // in a window without it, so a forked or renamed rollout keeps its events.
+        let thread = take_str(&mut p, "thread_id");
+        if thread.is_some_and(|t| !self.s.id.is_empty() && t != self.s.id) {
+            return;
+        }
         match ty.as_str() {
             "item_completed" => self.item_completed(p),
             "user_message" => self.legacy_user(p),
@@ -335,6 +344,7 @@ impl Parser {
                 item.extend(p);
                 match ty.as_str() {
                     "HookPrompt" => self.hook_prompt(item),
+                    "EnteredReviewMode" | "ExitedReviewMode" => self.review_notice(&ty, item),
                     "ContextCompaction" => self.fold_compaction(&ty, item),
                     "SubAgentActivity" | "CollabAgentToolCall" | "FunctionCallOutput" => {
                         let by_id = id.and_then(|id| self.calls.get(&id)).copied();
@@ -427,9 +437,13 @@ impl Parser {
         }
         let parent = take_str(&mut p, "parent_thread_id")
             .or_else(|| str_field(&spawn, &["parent_thread_id"]));
+        // A harness-run sub-agent (`/review`) names its kind as a plain string.
+        let kind = p.get("source").and_then(|s| str_field(s, &["subagent"]));
+        self.review = kind.as_deref() == Some("review");
         if let Some(session_id) = parent {
-            let agent_type =
-                take_str(&mut p, "agent_path").or_else(|| str_field(&spawn, &["agent_path"]));
+            let agent_type = take_str(&mut p, "agent_path")
+                .or_else(|| str_field(&spawn, &["agent_path"]))
+                .or(kind);
             self.s.parent = Some(ParentLink {
                 session_id,
                 call_id: None,
@@ -546,6 +560,34 @@ impl Parser {
             retry: None,
         };
         self.push(None, None, EntryKind::Error(info), p);
+    }
+
+    /// `/review` starts and ends: the target, then the verdict (the findings stay in `extra`).
+    fn review_notice(&mut self, ty: &str, mut item: Obj) {
+        let id = take_str(&mut item, "id");
+        let turn = take_str(&mut item, "turn_id");
+        let text = match (ty, item.get("review_output")) {
+            ("ExitedReviewMode", Some(out @ Value::Object(_))) => {
+                let n = out["findings"].as_array().map_or(0, Vec::len);
+                let s = if n == 1 { "" } else { "s" };
+                let verdict = str_field(out, &["overall_correctness"]).unwrap_or_default();
+                let why = str_field(out, &["overall_explanation"]).unwrap_or_default();
+                format!("Review done, {verdict}, {n} finding{s}: {why}")
+            }
+            // `review_output` is an `Option` in Codex: null when the review was interrupted.
+            ("ExitedReviewMode", _) => "Review ended without a result".into(),
+            _ => {
+                let hint = obj_str(&item, "user_facing_hint")
+                    .or_else(|| item.get("target").and_then(|t| str_field(t, &["type"])));
+                format!("Review: {}", hint.unwrap_or_default())
+            }
+        };
+        let notice = Notice {
+            level: None,
+            kind: Some(ty.into()),
+            text,
+        };
+        self.push(id, turn, EntryKind::Notice(notice), item);
     }
 
     fn rewind(&mut self, mut p: Obj) {
@@ -721,6 +763,28 @@ impl Parser {
         }
         self.close_group();
         self.running_children();
+        // A review child is titled by its prompt, as Codex names the thread; marked last, since
+        // prompts pair with their second copy as human ones.
+        if self.review {
+            let first = self.s.messages().find(|m| m.origin == Origin::Human);
+            self.s.title = first.and_then(|m| one_line(&m.text(), 120));
+            for e in &mut self.s.entries {
+                if let EntryKind::Message(m) = &mut e.kind {
+                    if m.origin == Origin::Human {
+                        m.origin = Origin::Command;
+                    }
+                }
+            }
+        }
+        // A `codex exec review` parent holds no prompt of its own: titled by the review target.
+        if self.s.title.is_none() && !self.s.messages().any(|m| m.origin == Origin::Human) {
+            self.s.title = (self.s.entries.iter()).find_map(|e| match &e.kind {
+                EntryKind::Notice(n) if n.kind.as_deref() == Some("EnteredReviewMode") => {
+                    Some(n.text.clone())
+                }
+                _ => None,
+            });
+        }
         let format = if !self.enveloped {
             "codex-flat"
         } else if self.paginated {

@@ -97,7 +97,10 @@ fn typed(name: &str, args: &Value, has_agent_id: bool) -> Option<Tool> {
         "write_todos" | "write_todos_list" => Tool::Todo {
             items: todos(args.get("todos")?)?,
         },
-        "ask_user" => Tool::Question,
+        "ask_user" => Tool::Question {
+            questions: Vec::new(),
+            declined: false,
+        },
         "enter_plan_mode" | "exit_plan_mode" => Tool::Plan,
         "activate_skill" => Tool::Skill {
             name: text(&["name"]),

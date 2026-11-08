@@ -456,7 +456,10 @@ fn classify(name: &str, input: &Value, cwd: Option<&str>) -> Tool {
             agent_type: s(&["subagent_type", "agent"]),
             name: None,
         }),
-        "question" => Some(Tool::Question),
+        "question" => Some(Tool::Question {
+            questions: Vec::new(),
+            declined: false,
+        }),
         "execute" => s(&["code"]).map(|source| Tool::Code { source }),
         "update_goal_plan" => Some(Tool::Todo {
             items: goal_phases(input),

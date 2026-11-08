@@ -37,7 +37,7 @@ Where usage is attached:
 
 `Session.usage` is the sum of message usage and compaction usage. `cost_usd` on the session is the product's recorded session cost when one exists (Claude Code), else the sum of recorded message costs. If a product records a total that does not fit the scheme, it stays in `extra`.
 
-A message that is split in two (for example a Codex response with two phases) keeps its usage on the first piece only, so nothing is counted twice.
+A message that is split in two (for example a Codex response with two phases) keeps its usage on the first piece only, so nothing is counted twice. A Claude Code message that goes on after a context line is the exception: its usage is on the last piece, because later lines of one API message carry the final count.
 
 ## Tool status
 
@@ -77,7 +77,7 @@ Rules that apply to every product:
 
 | Rule | Detail |
 |---|---|
-| Mixed records are split | If one source record holds parts of different kinds, it becomes consecutive messages with ids suffixed `#1`, `#2` |
+| Mixed records are split | If one source record holds parts of different kinds, it becomes consecutive messages with ids suffixed `#1`, `#2`. A Claude Code message split at a context line is different: the first piece keeps the bare `message.id` and later pieces are `<message.id>#2`, `#3` |
 | System versus notice | `Role::System` is harness text the model saw (Codex developer messages, OpenCode system rows). A `Notice` entry is a record the model did not see |
 | Tool results are not user messages | They fold into their call. A result without a call becomes `Part::ToolResult` inside a message with origin `Tool`, plus a warning |
 | Interrupts | An interrupt marker (a Claude Code interrupt text, a Codex aborted turn, an OpenCode abort) becomes `Turn` with status `interrupted` |

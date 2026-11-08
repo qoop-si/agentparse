@@ -6,7 +6,7 @@ use crate::util::{
     Obj, bool_field, diff_stat, mcp_tool, str_field, stripped, take_bool, take_str, u64_field,
 };
 use crate::{
-    FileChange, FileOp, Media, ProcessAction, Shell, ShellResult, TextEdit, TodoItem, Tool,
+    Asked, FileChange, FileOp, Media, ProcessAction, Shell, ShellResult, TextEdit, TodoItem, Tool,
     ToolCall, ToolOutput, ToolStatus,
 };
 use serde_json::{Value, json};
@@ -158,7 +158,10 @@ fn typed(name: &str, i: &Value, cwd: Option<&str>) -> Option<Tool> {
             agent_type: None,
             name: s(&["to"]),
         },
-        "AskUserQuestion" => Tool::Question,
+        "AskUserQuestion" => Tool::Question {
+            questions: Asked::from_input(i),
+            declined: false,
+        },
         "EnterPlanMode" | "ExitPlanMode" => Tool::Plan,
         "Skill" => Tool::Skill {
             name: s(&["skill", "name"]),
@@ -203,26 +206,38 @@ pub(super) fn outcome(
 ) -> Outcome {
     let is_error = take_bool(&mut block, "is_error");
     let content = block.remove("content").unwrap_or(Value::Null);
-    let (text, attachments) = result_content(&content);
+    let (text, attachments, references) = result_content(&content);
     let mut out = ToolOutput {
         text,
         attachments,
         ..Default::default()
     };
-    let status = denial_status(denial.as_deref()).unwrap_or_else(|| {
-        if is_error {
-            error_status(&out.text)
-        } else {
-            ToolStatus::Ok
-        }
-    });
+    // The clarify choice of a question is the user's answer, not a refusal.
+    let clarify = name == "AskUserQuestion"
+        && out
+            .text
+            .contains("The user wants to clarify these questions.");
+    let status = denial_status(denial.as_deref())
+        .filter(|_| !clarify)
+        .unwrap_or_else(|| {
+            if is_error && !clarify {
+                error_status(&out.text)
+            } else {
+                ToolStatus::Ok
+            }
+        });
     let mut child = None;
     let mut async_launch = false;
+    let mut launch_in_text = true;
     match tur {
         Some(Value::Object(map)) => {
             async_launch = matches!(name, "Agent" | "Task" | "Workflow")
-                && map.get("status").and_then(Value::as_str) == Some("async_launched");
+                && matches!(
+                    map.get("status").and_then(Value::as_str),
+                    Some("async_launched" | "teammate_spawned")
+                );
             child = structured(name, input, map, &mut out);
+            launch_in_text = false;
         }
         // A string result is the error text again, with an `Error: ` prefix.
         Some(Value::String(s)) => {
@@ -232,6 +247,13 @@ pub(super) fn outcome(
         }
         Some(v @ Value::Array(_)) if v != content => out.data = Some(stripped(v)),
         _ => {}
+    }
+    // About 40% of result lines carry no `toolUseResult` object; their text says the same.
+    if launch_in_text {
+        (child, async_launch) = text_launch(name, &mut out);
+        if !references.is_empty() {
+            set_data(&mut out.data, "matches", json!(references));
+        }
     }
     let status = if matches!(name, "Bash" | "Monitor") {
         shell_detail(&mut out, status)
@@ -251,30 +273,147 @@ pub(super) fn outcome(
     Outcome {
         output: out,
         status,
-        detail: denial,
+        detail: if clarify {
+            Some("clarify".into())
+        } else {
+            denial
+        },
         child,
     }
 }
 
-fn result_content(content: &Value) -> (String, Vec<Media>) {
+/// The text, the media, and the tool names of `tool_reference` blocks (a ToolSearch result:
+/// the `matches` of its structured result, which most lines lack).
+fn result_content(content: &Value) -> (String, Vec<Media>, Vec<String>) {
     match content {
-        Value::String(s) => (s.clone(), Vec::new()),
+        Value::String(s) => (s.clone(), Vec::new(), Vec::new()),
         Value::Array(items) => {
             let mut texts = Vec::new();
             let mut media_items = Vec::new();
+            let mut references = Vec::new();
             for item in items {
-                match (item.get("type").and_then(Value::as_str), item) {
-                    (Some("text"), _) => {
-                        texts.push(item.get("text").and_then(Value::as_str).unwrap_or_default())
-                    }
+                let text = |key| item.get(key).and_then(Value::as_str);
+                match (text("type"), item) {
+                    (Some("text"), _) => texts.push(text("text").unwrap_or_default()),
                     (Some("image" | "document"), Value::Object(b)) => media_items.push(media(b)),
-                    // `tool_reference` blocks repeat the `matches` of the structured result.
+                    (Some("tool_reference"), _) => {
+                        references.extend(text("tool_name").map(String::from))
+                    }
                     _ => {}
                 }
             }
-            (texts.join("\n"), media_items)
+            (texts.join("\n"), media_items, references)
         }
-        _ => (String::new(), Vec::new()),
+        _ => (String::new(), Vec::new(), Vec::new()),
+    }
+}
+
+/// The launch a result text names: the child agent of an Agent call, a workflow's task, run and
+/// summary, or the task id of a backgrounded Bash, Monitor or MCP call. Returns the child and
+/// whether an agent or workflow was launched (a background id goes into `out.shell`).
+fn text_launch(name: &str, out: &mut ToolOutput) -> (Option<String>, bool) {
+    let ToolOutput {
+        text, data, shell, ..
+    } = out;
+    match name {
+        "Agent" | "Task" => {
+            // The id line is the last one: a foreground agent's report comes before it.
+            let child = text.lines().rev().find_map(|l| {
+                l.strip_prefix("agentId: ")
+                    .or_else(|| l.strip_prefix("agent_id: "))
+                    .and_then(|rest| rest.split_whitespace().next())
+            });
+            let teammate = text.starts_with("Spawned successfully");
+            if teammate {
+                set_data(data, "status", json!("teammate_spawned"));
+            }
+            if let Some(n) = tool_uses(text) {
+                set_data(data, "totalToolUseCount", json!(n));
+            }
+            let launched = teammate || text.starts_with("Async agent launched successfully");
+            (child.map(String::from), launched)
+        }
+        "Workflow" => {
+            let Some(rest) = text.strip_prefix("Workflow launched in background.") else {
+                return (None, false);
+            };
+            // Keys only at a line start: the resume hint names the run id a second time.
+            let task = rest
+                .lines()
+                .next()
+                .and_then(|l| l.trim().strip_prefix("Task ID: "));
+            let key = |k: &str| text.lines().find_map(|l| l.strip_prefix(k));
+            let keys = [
+                ("taskId", task),
+                ("runId", key("Run ID: ")),
+                ("summary", key("Summary: ")),
+            ];
+            for (k, v) in keys {
+                if let Some(v) = v {
+                    set_data(data, k, json!(v.trim()));
+                }
+            }
+            (None, true)
+        }
+        _ => {
+            if let Some(id) = background_task(name, text) {
+                shell.get_or_insert_default().background_id = Some(id);
+            }
+            (None, false)
+        }
+    }
+}
+
+/// `Command running in background with ID: X.` (the whole text), `Command did not complete
+/// within its 120s timeout and was moved to the background (ID: X).` (the last line, after any
+/// partial output), `Monitor started (task X, ...` and `MCP tool "s/t" ... moved to the
+/// background as task X ...`. A Bash text may also hold the harness's leading `Shell cwd was
+/// reset to ..` line and trailing `Session cwd remains ..` line; any other line is the
+/// command's own output, so a printed launch line is no launch.
+fn background_task(name: &str, text: &str) -> Option<String> {
+    let id = |rest: &str| {
+        let id = rest.split(|c: char| !c.is_ascii_alphanumeric()).next()?;
+        (!id.is_empty()).then(|| id.to_string())
+    };
+    let rest = match name {
+        "Bash" => {
+            let body = text
+                .strip_prefix("Shell cwd was reset to ")
+                .and_then(|t| t.split_once('\n'))
+                .map_or(text, |(_, rest)| rest);
+            body.strip_prefix("Command running in background with ID: ")
+                .or_else(|| {
+                    body.lines()
+                        .rfind(|l| !l.starts_with("Session cwd remains "))?
+                        .strip_prefix("Command did not complete within its ")?
+                        .split_once("moved to the background (ID: ")
+                        .map(|(_, r)| r)
+                })
+        }
+        "Monitor" => text.strip_prefix("Monitor started (task "),
+        n if n.starts_with("mcp__") && text.starts_with("MCP tool \"") => text
+            .split_once("moved to the background as task ")
+            .map(|(_, r)| r),
+        _ => None,
+    };
+    id(rest?)
+}
+
+/// The step count of an agent's report: `tool_uses: N` in the `<usage>` block of a result text,
+/// or `<tool_uses>N</tool_uses>` in that of a task notification. The last block is the report's own.
+fn tool_uses(text: &str) -> Option<u64> {
+    let usage = tag_body(&text[text.rfind("<usage>")?..], "usage")?;
+    tag_body(usage, "tool_uses")
+        .or_else(|| usage.lines().find_map(|l| l.strip_prefix("tool_uses: ")))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Set `key` in `data`, made an object when it is missing; any other shape is left alone.
+fn set_data(data: &mut Option<Value>, key: &str, value: Value) {
+    if let Value::Object(map) = data.get_or_insert_with(|| json!({})) {
+        map.insert(key.into(), value);
     }
 }
 
@@ -559,14 +698,71 @@ pub(super) fn task_id(call: &ToolCall) -> Option<&str> {
     shell.or(call.child_session.as_deref()).or_else(data)
 }
 
-/// A launched workflow's one line text is the `summary` of its launch result.
+/// What a result adds to the typed view of its call: a launched workflow's one line text (the
+/// `summary` of its launch result), and a question call's answers (from
+/// `toolUseResult.answers`, or else from the text) and whether the user declined.
 pub(super) fn launch_summary(call: &mut ToolCall) {
-    let summary = call
-        .output
-        .as_ref()
-        .and_then(|o| o.data.as_ref()?.get("summary")?.as_str());
-    if let (Tool::Task { description, .. }, Some(summary)) = (&mut call.tool, summary) {
-        description.get_or_insert_with(|| summary.to_string());
+    let Some(out) = call.output.as_ref() else {
+        return;
+    };
+    let data = |key| out.data.as_ref()?.get(key);
+    match &mut call.tool {
+        Tool::Task { description, .. } => {
+            if let Some(summary) = data("summary").and_then(Value::as_str) {
+                description.get_or_insert_with(|| summary.to_string());
+            }
+        }
+        Tool::Question {
+            questions,
+            declined,
+        } => {
+            *declined = call.status == ToolStatus::Rejected;
+            for q in questions.iter_mut() {
+                q.answer = data("answers")
+                    .and_then(|a| a.get(&q.question)?.as_str())
+                    .map(String::from);
+            }
+            text_answers(&out.text, questions);
+        }
+        _ => {}
+    }
+}
+
+/// `..: "q1"="a1", "q2"="a2". You can now ...`: an answer runs to the next asked question's pair,
+/// or for the last one to the text's last `".`, so an answer may hold quotes. Claude may put
+/// ` selected preview:` or ` user notes:` after an answer's closing quote; the first such
+/// marker ends it.
+fn text_answers(text: &str, questions: &mut [Asked]) {
+    let pairs: Vec<Option<(usize, usize)>> = questions
+        .iter()
+        .map(|q| {
+            let key = format!("\"{}\"=\"", q.question);
+            text.find(&key).map(|at| (at, at + key.len()))
+        })
+        .collect();
+    let last = text.rfind("\".");
+    for (q, pair) in questions.iter_mut().zip(&pairs) {
+        let Some((_, from)) = *pair else {
+            continue;
+        };
+        let next = pairs
+            .iter()
+            .flatten()
+            .map(|&(at, _)| at)
+            .filter(|&at| at > from)
+            .min();
+        let marked = ["\" selected preview:", "\" user notes:"]
+            .iter()
+            .filter_map(|m| text[from..next.unwrap_or(text.len())].find(m))
+            .min()
+            .map(|i| from + i);
+        let to = marked.or(match next {
+            Some(at) => text[..at].strip_suffix("\", ").map(str::len),
+            None => last.filter(|&end| end >= from),
+        });
+        if let (None, Some(to)) = (&q.answer, to) {
+            q.answer = Some(text[from..to].to_string());
+        }
     }
 }
 
@@ -601,6 +797,17 @@ pub(super) fn apply_notification(call: &mut ToolCall, note: &str, ts: Option<i64
     let ended = matches!(status, "killed" | "stopped" | "ended");
     let (code, soft) = summary_exit(tag_body(note, "summary").unwrap_or_default());
     let out = call.output.get_or_insert_default();
+    if let Some(n) = tool_uses(note) {
+        set_data(&mut out.data, "totalToolUseCount", json!(n));
+    }
+    // The report is the call's output; the launch text it replaces stays in `data.launch`.
+    let report = tag_body(note, "result").filter(|_| status == "completed");
+    if let (Some(report), None | Some(Value::Object(_))) = (report, &out.data) {
+        let launch = std::mem::replace(&mut out.text, report.to_string());
+        if out.data.as_ref().and_then(|d| d.get("launch")).is_none() {
+            set_data(&mut out.data, "launch", json!(launch));
+        }
+    }
     if matches!(call.tool, Tool::Shell(_)) {
         if out.full_output_path.is_none() {
             out.full_output_path = tag_body(note, "output-file").map(String::from);

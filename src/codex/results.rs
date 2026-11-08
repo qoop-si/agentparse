@@ -280,12 +280,22 @@ pub(super) fn read_cell(items: &[String]) -> Cell {
         cell.truncated |= item.starts_with(TRUNCATED);
         let json = item
             .find('{')
-            .and_then(|i| serde_json::from_str::<Value>(&item[i..]).ok());
+            .and_then(|i| serde_json::from_str::<Value>(&item[i..]).ok())
+            .map(settled);
         if let Some(chunk) = json.filter(|j| j.get("exit_code").is_none()) {
             cell.running.extend(str_field(&chunk, &["session_id"]));
         }
     }
     cell
+}
+
+/// A script that prints its `Promise.allSettled` results prints each call's result as the
+/// `value` of `{status: "fulfilled", value}`.
+fn settled(v: Value) -> Value {
+    match v.get("value") {
+        Some(inner @ Value::Object(_)) if v["status"] == "fulfilled" => inner.clone(),
+        _ => v,
+    }
 }
 
 /// `Wall time 1.2 seconds` (code mode) or `Wall time: 0.1234 seconds` (direct tools).
